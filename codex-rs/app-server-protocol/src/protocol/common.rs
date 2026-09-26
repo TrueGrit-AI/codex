@@ -502,6 +502,20 @@ client_request_definitions! {
         response: v1::InitializeResponse,
     },
 
+    #[experimental("agentTeams/node/register")]
+    /// Make this connection the node's link to the distributed agent-team relay.
+    AgentTeamsNodeRegister => "agentTeams/node/register" {
+        params: v2::AgentTeamsNodeRegisterParams,
+        serialization: None,
+        response: v2::AgentTeamsNodeRegisterResponse,
+    },
+    #[experimental("agentTeams/host/command")]
+    /// Run a relay-dispatched command on an agent thread this node hosts.
+    AgentTeamsHostCommand => "agentTeams/host/command" {
+        params: v2::AgentTeamsHostCommandParams,
+        serialization: None,
+        response: v2::AgentTeamsHostCommandResponse,
+    },
     #[experimental("server/diagnostics")]
     /// Read content-free, process-local diagnostics.
     ServerDiagnostics => "server/diagnostics" {
@@ -1807,6 +1821,13 @@ server_request_definitions! {
     AttestationGenerate => "attestation/generate" {
         params: v2::AttestationGenerateParams,
         response: v2::AttestationGenerateResponse,
+    },
+
+    #[experimental("agentTeams/relay")]
+    /// Ask the node's relay link to place, look up or dispatch for distributed agent teams.
+    AgentTeamsRelay => "agentTeams/relay" {
+        params: v2::AgentTeamsRelayParams,
+        response: v2::AgentTeamsRelayResponse,
     },
 
     #[experimental("currentTime/read")]

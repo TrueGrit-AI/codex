@@ -188,6 +188,12 @@ impl PendingAppServerRequests {
                     message: "External current time is not available in TUI.".to_string(),
                 })
             }
+            ServerRequest::AgentTeamsRelay { request_id, .. } => {
+                Some(UnsupportedAppServerRequest {
+                    request_id: request_id.clone(),
+                    message: "The agent-teams relay is not available in TUI.".to_string(),
+                })
+            }
             ServerRequest::ApplyPatchApproval { request_id, .. } => {
                 Some(UnsupportedAppServerRequest {
                     request_id: request_id.clone(),
@@ -432,6 +438,7 @@ impl PendingAppServerRequests {
             ServerRequest::ChatgptAuthTokensRefresh { .. } => true,
             ServerRequest::DynamicToolCall { .. }
             | ServerRequest::AttestationGenerate { .. }
+            | ServerRequest::AgentTeamsRelay { .. }
             | ServerRequest::CurrentTimeRead { .. }
             | ServerRequest::ApplyPatchApproval { .. }
             | ServerRequest::ExecCommandApproval { .. } => false,

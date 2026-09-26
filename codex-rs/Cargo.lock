@@ -1995,6 +1995,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-agent-teams-host"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "codex-agent-teams-wire",
+ "codex-core",
+ "codex-features",
+ "codex-login",
+ "codex-models-manager",
+ "codex-protocol",
+ "codex-rollout-trace",
+ "core_test_support",
+ "futures",
+ "pretty_assertions",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "wiremock",
+]
+
+[[package]]
+name = "codex-agent-teams-wire"
+version = "0.0.0"
+dependencies = [
+ "codex-protocol",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "codex-analytics"
 version = "0.0.0"
 dependencies = [
@@ -2074,6 +2105,8 @@ dependencies = [
  "chrono",
  "clap",
  "codex-agent-extension",
+ "codex-agent-teams-host",
+ "codex-agent-teams-wire",
  "codex-analytics",
  "codex-app-server-protocol",
  "codex-app-server-transport",

@@ -71,6 +71,8 @@ pub use agent::types::MessageDeliveryMode;
 pub use agent::types::ResolvedMultiAgentV2UsageHints;
 pub use agent::types::SpawnAgentForkMode;
 pub use agent::types::SpawnAgentOptions;
+/// Helpers for host-owned `AgentControl` backends.
+pub use agent::host as agent_host;
 pub use rollout_budget::RolloutBudgetReminder;
 mod agent_communication;
 mod agent_message_board;

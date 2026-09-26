@@ -1,0 +1,32 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "codex-agent-teams-host"
+version.workspace = true
+
+[lib]
+name = "codex_agent_teams_host"
+path = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+codex-agent-teams-wire = { workspace = true }
+codex-core = { workspace = true }
+codex-protocol = { workspace = true }
+codex-rollout-trace = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+codex-features = { workspace = true }
+codex-login = { workspace = true }
+codex-models-manager = { workspace = true }
+core_test_support = { workspace = true }
+pretty_assertions = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+wiremock = { workspace = true }
