@@ -64,6 +64,7 @@ impl AgentTeamsNode {
         });
         let relay_handle: Arc<dyn TeamRelay> = relay.clone();
         let endpoint = HostEndpoint::new(NodeId::new(node_id), relay_handle);
+        crate::request_processors::allow_operator_input_for_subagents();
         Some(Arc::new(Self { endpoint, relay }))
     }
 

@@ -227,6 +227,8 @@ impl HostEndpoint {
                 return Err(err);
             }
         };
+        // Like a locally spawned agent: listeners attach, status is tracked, viewers can resume it.
+        manager.notify_thread_created(started.thread_id);
         started
             .thread
             .submit(Op::InterAgentCommunication {

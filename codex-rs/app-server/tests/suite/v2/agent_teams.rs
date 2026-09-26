@@ -170,6 +170,7 @@ async fn lead_and_member_in_separate_app_servers_form_one_team() -> Result<()> {
         vec![
             responses::sse_response(answer("m1", "Three events today."))
                 .set_delay(Duration::from_millis(500)),
+            responses::sse_response(answer("m2", "Tomorrow is free.")),
         ],
     )
     .await;
@@ -195,7 +196,7 @@ async fn lead_and_member_in_separate_app_servers_form_one_team() -> Result<()> {
     let lead_id = NodeId::new("lead");
     let member_id = NodeId::new("member");
     let mut lead = start_node(lead_id.as_str(), &lead_server, &lead_home).await?;
-    let mut member = start_node(member_id.as_str(), &member_server, &member_home).await?;
+    let member = start_node(member_id.as_str(), &member_server, &member_home).await?;
 
     let ThreadStartResponse { thread, .. } =
         lead.start_thread(ThreadStartParams::default()).await?;
@@ -223,90 +224,28 @@ async fn lead_and_member_in_separate_app_servers_form_one_team() -> Result<()> {
         in_flight: HashMap::new(),
         dispatches: Vec::new(),
     };
+    let mut nodes = Nodes {
+        lead,
+        member,
+        lead_id: lead_id.clone(),
+        member_id: member_id.clone(),
+    };
 
-    timeout(Duration::from_secs(30), async {
-        let mut turn_started = false;
-        loop {
-            // Reads are cancellation safe, so waiting on both nodes cannot drop a message.
-            let (from, message) = tokio::select! {
-                message = lead.read_next_message() => (lead_id.clone(), message?),
-                message = member.read_next_message() => (member_id.clone(), message?),
-            };
-            let node = |id: &NodeId| id == &lead_id;
-            match message {
-                JSONRPCMessage::Request(request) if request.method == "agentTeams/relay" => {
-                    let params: AgentTeamsRelayParams =
-                        serde_json::from_value(request.params.unwrap_or_default())?;
-                    match relay.handle(&from, serde_json::from_value(params.request)?)? {
-                        Step::Answer(response) => {
-                            let server = if node(&from) { &mut lead } else { &mut member };
-                            server
-                                .send_response(request.id, relay_response(response)?)
-                                .await?;
-                        }
-                        Step::Forward { target, envelope } => {
-                            let server = if node(&target) {
-                                &mut lead
-                            } else {
-                                &mut member
-                            };
-                            let forwarded = server
-                                .send_request(
-                                    "agentTeams/host/command",
-                                    Some(serde_json::to_value(AgentTeamsHostCommandParams {
-                                        envelope,
-                                    })?),
-                                )
-                                .await?;
-                            relay.in_flight.insert(
-                                (target, RequestId::Integer(forwarded)),
-                                (from.clone(), request.id),
-                            );
-                        }
-                    }
-                }
-                JSONRPCMessage::Response(response) => {
-                    if let Some((asker, relay_request)) =
-                        relay.in_flight.remove(&(from.clone(), response.id.clone()))
-                    {
-                        let reply: AgentTeamsHostCommandResponse =
-                            serde_json::from_value(response.result)?;
-                        let server = if node(&asker) { &mut lead } else { &mut member };
-                        server
-                            .send_response(
-                                relay_request,
-                                relay_response(RelayResponse::Dispatched {
-                                    reply: serde_json::from_value(reply.reply)?,
-                                })?,
-                            )
-                            .await?;
-                    } else if node(&from) && response.id == RequestId::Integer(turn_request) {
-                        turn_started = true;
-                    }
-                }
-                JSONRPCMessage::Error(error) => {
-                    if let Some((asker, relay_request)) =
-                        relay.in_flight.remove(&(from.clone(), error.id.clone()))
-                    {
-                        let server = if node(&asker) { &mut lead } else { &mut member };
-                        server.send_error(relay_request, error.error).await?;
-                    } else {
-                        bail!("{from} returned an error: {error:?}");
-                    }
-                }
-                JSONRPCMessage::Notification(notification)
-                    if node(&from) && turn_started && notification.method == "turn/completed" =>
-                {
-                    break Ok::<_, anyhow::Error>(());
-                }
-                JSONRPCMessage::Request(request) => {
-                    bail!("{from} sent an unexpected request: {}", request.method);
-                }
-                JSONRPCMessage::Notification(_) => {}
+    let mut turn_started = false;
+    nodes
+        .pump(&mut relay, |from, message| match message {
+            JSONRPCMessage::Response(response)
+                if from == &lead_id && response.id == RequestId::Integer(turn_request) =>
+            {
+                turn_started = true;
+                false
             }
-        }
-    })
-    .await??;
+            JSONRPCMessage::Notification(notification) => {
+                from == &lead_id && turn_started && notification.method == "turn/completed"
+            }
+            _ => false,
+        })
+        .await?;
 
     // The lead's request after `wait_agent` carries the member's result, delivered across
     // processes with the same notice local sub-agents produce.
@@ -327,7 +266,8 @@ async fn lead_and_member_in_separate_app_servers_form_one_team() -> Result<()> {
         .agents
         .iter()
         .find(|record| record.agent_path.name() == "mail")
-        .expect("mail member registered");
+        .expect("mail member registered")
+        .clone();
     assert_eq!(
         (&mail.node_id, mail.team_id, mail.parent_thread_id),
         (&member_id, team_id, Some(team_id))
@@ -339,5 +279,182 @@ async fn lead_and_member_in_separate_app_servers_form_one_team() -> Result<()> {
             (member_id.clone(), lead_id.clone()),
         ]
     );
+
+    // An operator viewer on the member's machine attaches to the member and types into it.
+    let resume_request = nodes
+        .member
+        .send_request(
+            "thread/resume",
+            Some(serde_json::json!({ "threadId": mail.thread_id.to_string() })),
+        )
+        .await?;
+    let mut resumed = None;
+    nodes
+        .pump(&mut relay, |from, message| match message {
+            JSONRPCMessage::Response(response)
+                if from == &member_id && response.id == RequestId::Integer(resume_request) =>
+            {
+                resumed = Some(response.result.clone());
+                true
+            }
+            _ => false,
+        })
+        .await?;
+    let resumed = resumed.expect("resume response");
+    assert_eq!(
+        (
+            resumed["thread"]["canAcceptDirectInput"].clone(),
+            resumed["thread"]["status"]["type"] != "notLoaded"
+        ),
+        (serde_json::json!(true), true),
+        "{resumed:#}"
+    );
+
+    let operator_turn = nodes
+        .member
+        .send_request(
+            "turn/start",
+            Some(serde_json::to_value(TurnStartParams {
+                thread_id: mail.thread_id.to_string(),
+                input: vec![UserInput::Text {
+                    text: "Operator: also check tomorrow.".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                ..Default::default()
+            })?),
+        )
+        .await?;
+    let mut operator_turn_started = false;
+    let member_thread_id = mail.thread_id.to_string();
+    nodes
+        .pump(&mut relay, |from, message| match message {
+            JSONRPCMessage::Response(response)
+                if from == &member_id && response.id == RequestId::Integer(operator_turn) =>
+            {
+                operator_turn_started = true;
+                false
+            }
+            JSONRPCMessage::Notification(notification) => {
+                from == &member_id
+                    && operator_turn_started
+                    && notification.method == "turn/completed"
+                    && notification.params.as_ref().is_some_and(|params| {
+                        params["threadId"] == serde_json::json!(member_thread_id)
+                    })
+            }
+            _ => false,
+        })
+        .await?;
+    let member_bodies = bodies(&member_mock);
+    assert!(
+        member_bodies[1].contains("Operator: also check tomorrow."),
+        "{}",
+        member_bodies[1]
+    );
+    // The operator's turn is reported to the lead like any other member result.
+    assert_eq!(
+        relay.dispatches.last(),
+        Some(&(member_id.clone(), lead_id.clone()))
+    );
     Ok(())
+}
+
+/// Both app-server processes, with the test acting as their relay.
+struct Nodes {
+    lead: TestAppServer,
+    member: TestAppServer,
+    lead_id: NodeId,
+    member_id: NodeId,
+}
+
+impl Nodes {
+    fn server(&mut self, id: &NodeId) -> &mut TestAppServer {
+        if id == &self.lead_id {
+            &mut self.lead
+        } else {
+            &mut self.member
+        }
+    }
+
+    /// Relay traffic between the nodes until `stop` accepts a message.
+    async fn pump(
+        &mut self,
+        relay: &mut TestRelay,
+        mut stop: impl FnMut(&NodeId, &JSONRPCMessage) -> bool,
+    ) -> Result<()> {
+        timeout(Duration::from_secs(30), async {
+            loop {
+                // Reads are cancellation safe, so waiting on both nodes cannot drop a message.
+                let (from, message) = tokio::select! {
+                    message = self.lead.read_next_message() => (self.lead_id.clone(), message?),
+                    message = self.member.read_next_message() => (self.member_id.clone(), message?),
+                };
+                match &message {
+                    JSONRPCMessage::Request(request) if request.method == "agentTeams/relay" => {
+                        let params: AgentTeamsRelayParams =
+                            serde_json::from_value(request.params.clone().unwrap_or_default())?;
+                        match relay.handle(&from, serde_json::from_value(params.request)?)? {
+                            Step::Answer(response) => {
+                                self.server(&from)
+                                    .send_response(request.id.clone(), relay_response(response)?)
+                                    .await?;
+                            }
+                            Step::Forward { target, envelope } => {
+                                let forwarded = self
+                                    .server(&target)
+                                    .send_request(
+                                        "agentTeams/host/command",
+                                        Some(serde_json::to_value(AgentTeamsHostCommandParams {
+                                            envelope,
+                                        })?),
+                                    )
+                                    .await?;
+                                relay.in_flight.insert(
+                                    (target, RequestId::Integer(forwarded)),
+                                    (from.clone(), request.id.clone()),
+                                );
+                            }
+                        }
+                        continue;
+                    }
+                    JSONRPCMessage::Response(response) => {
+                        if let Some((asker, relay_request)) =
+                            relay.in_flight.remove(&(from.clone(), response.id.clone()))
+                        {
+                            let reply: AgentTeamsHostCommandResponse =
+                                serde_json::from_value(response.result.clone())?;
+                            self.server(&asker)
+                                .send_response(
+                                    relay_request,
+                                    relay_response(RelayResponse::Dispatched {
+                                        reply: serde_json::from_value(reply.reply)?,
+                                    })?,
+                                )
+                                .await?;
+                            continue;
+                        }
+                    }
+                    JSONRPCMessage::Error(error) => {
+                        if let Some((asker, relay_request)) =
+                            relay.in_flight.remove(&(from.clone(), error.id.clone()))
+                        {
+                            self.server(&asker)
+                                .send_error(relay_request, error.error.clone())
+                                .await?;
+                            continue;
+                        }
+                        bail!("{from} returned an error: {error:?}");
+                    }
+                    JSONRPCMessage::Request(request) => {
+                        bail!("{from} sent an unexpected request: {}", request.method);
+                    }
+                    JSONRPCMessage::Notification(_) => {}
+                }
+                if stop(&from, &message) {
+                    break Ok::<_, anyhow::Error>(());
+                }
+            }
+        })
+        .await?
+    }
 }

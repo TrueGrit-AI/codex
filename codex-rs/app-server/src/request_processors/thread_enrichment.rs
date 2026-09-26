@@ -1,5 +1,5 @@
 use super::apply_live_thread_settings;
-use super::thread_input::can_accept_direct_input;
+use super::thread_input::accepts_operator_input;
 use crate::thread_status::ThreadWatchManager;
 use crate::thread_status::resolve_thread_status;
 use codex_app_server_protocol::SessionSource;
@@ -83,7 +83,7 @@ async fn enrich_loaded_thread(
             return;
         }
     }
-    thread.can_accept_direct_input = Some(can_accept_direct_input(
+    thread.can_accept_direct_input = Some(accepts_operator_input(
         loaded_thread.multi_agent_version(),
         &config_snapshot.session_source,
     ));
