@@ -2002,6 +2002,7 @@ dependencies = [
  "codex-agent-teams-wire",
  "codex-core",
  "codex-features",
+ "codex-history",
  "codex-login",
  "codex-models-manager",
  "codex-protocol",

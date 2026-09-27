@@ -716,3 +716,132 @@ async fn team_budget_stops_turns_once_exhausted_body() -> anyhow::Result<()> {
     lead.test.codex.shutdown_and_wait().await?;
     Ok(())
 }
+
+#[test]
+fn member_forked_from_recent_turns_sees_the_parent_context() -> anyhow::Result<()> {
+    run_test_with_large_stack(
+        "member_forked_from_recent_turns_sees_the_parent_context",
+        member_forked_from_recent_turns_sees_the_parent_context_body,
+    )
+}
+
+async fn member_forked_from_recent_turns_sees_the_parent_context_body() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+    let relay = InMemoryRelay::new();
+    let lead_server = responses::start_mock_server().await;
+    let member_server = responses::start_mock_server().await;
+    let lead = start_node(&relay, "lead", &[], &lead_server, None).await?;
+    let _member = start_node(&relay, "member", &["mail"], &member_server, None).await?;
+
+    let member_mock = responses::mount_response_sequence(
+        &member_server,
+        vec![responses::sse_response(answer(
+            "m1",
+            "The code is PAPAYA-42.",
+        ))],
+    )
+    .await;
+    let lead_mock = responses::mount_sse_sequence(
+        &lead_server,
+        vec![
+            answer("l1", "Noted."),
+            call(
+                "spawn",
+                "spawn_agent",
+                serde_json::json!({
+                    "task_name": "mail",
+                    "agent_type": "mail",
+                    "message": "Repeat the code the user gave me.",
+                    "fork_turns": "2",
+                }),
+            ),
+            call("wait", "wait_agent", serde_json::json!({})),
+            answer("l4", "Done."),
+        ],
+    )
+    .await;
+
+    lead.test
+        .submit_turn("Remember this code: PAPAYA-42.")
+        .await?;
+    lead.test
+        .submit_turn("Ask the mail agent for my code.")
+        .await?;
+
+    // The member, on another node, started from the lead's recent turns.
+    wait_for_request(&member_mock, 1).await;
+    let member_first = &bodies(&member_mock)[0];
+    assert!(
+        member_first.contains("Remember this code: PAPAYA-42.")
+            && member_first.contains("Repeat the code the user gave me."),
+        "{member_first}"
+    );
+    let lead_bodies = bodies(&lead_mock);
+    assert!(
+        lead_bodies[3].contains("The code is PAPAYA-42."),
+        "{}",
+        lead_bodies[3]
+    );
+    Ok(())
+}
+
+#[test]
+fn fork_over_the_cap_is_refused_with_an_actionable_error() -> anyhow::Result<()> {
+    run_test_with_large_stack(
+        "fork_over_the_cap_is_refused_with_an_actionable_error",
+        fork_over_the_cap_is_refused_with_an_actionable_error_body,
+    )
+}
+
+async fn fork_over_the_cap_is_refused_with_an_actionable_error_body() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+    let relay = InMemoryRelay::new();
+    let lead_server = responses::start_mock_server().await;
+    let member_server = responses::start_mock_server().await;
+    let lead = start_node(&relay, "lead", &[], &lead_server, None).await?;
+    let _member = start_node(&relay, "member", &["mail"], &member_server, None).await?;
+    let team_id = lead.test.session_configured.thread_id;
+
+    let lead_mock = responses::mount_sse_sequence(
+        &lead_server,
+        vec![
+            answer("l1", "Noted."),
+            call(
+                "spawn",
+                "spawn_agent",
+                serde_json::json!({
+                    "task_name": "mail",
+                    "agent_type": "mail",
+                    "message": "Summarize the notes.",
+                    "fork_turns": "2",
+                }),
+            ),
+            answer("l3", "Could not delegate."),
+        ],
+    )
+    .await;
+
+    let notes = "note ".repeat(120_000);
+    lead.test
+        .submit_turn(&format!("Keep these notes: {notes}"))
+        .await?;
+    lead.test
+        .submit_turn("Have the mail agent summarize them.")
+        .await?;
+
+    let lead_bodies = bodies(&lead_mock);
+    assert!(
+        lead_bodies[2].contains("over the 512 KiB limit"),
+        "{}",
+        &lead_bodies[2][..lead_bodies[2].len().min(4000)]
+    );
+    // Nothing was placed or started for the refused spawn.
+    assert!(
+        relay
+            .agents(team_id)
+            .await?
+            .iter()
+            .all(|record| record.depth == 0)
+    );
+    Ok(())
+}

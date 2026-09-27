@@ -77,7 +77,14 @@ pub struct SpawnAgent {
     pub reasoning_effort: Option<ReasoningEffort>,
     /// The attributed first message; it always starts the child's first turn.
     pub initial_message: InterAgentCommunication,
+    /// Parent history the child is forked from (serialized rollout items), when the spawn asked
+    /// for the parent's last turns. At most [`MAX_FORK_HISTORY_BYTES`] serialized.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<Vec<serde_json::Value>>,
 }
+
+/// Largest serialized parent history a spawn may carry to another node.
+pub const MAX_FORK_HISTORY_BYTES: usize = 512 * 1024;
 
 /// Commands a node accepts for threads it hosts.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -175,12 +182,20 @@ pub enum RelayRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RelayResponse {
-    Placed { node_id: NodeId },
-    Dispatched { reply: HostReply },
+    Placed {
+        node_id: NodeId,
+    },
+    Dispatched {
+        reply: HostReply,
+    },
     Done,
-    Agents { records: Vec<AgentRecord> },
+    Agents {
+        records: Vec<AgentRecord>,
+    },
     /// The usage was recorded; `exhausted` means the team's budget is now used up.
-    UsageRecorded { exhausted: bool },
+    UsageRecorded {
+        exhausted: bool,
+    },
 }
 
 /// Versioned envelope for transports that carry `HostCommand`s between processes.
@@ -219,6 +234,7 @@ mod tests {
                 "List today's events.".to_string(),
                 /*trigger_turn*/ true,
             ),
+            history: None,
         });
         let envelope = HostCommandEnvelope {
             protocol_version: PROTOCOL_VERSION,
@@ -228,6 +244,8 @@ mod tests {
         };
         let json = serde_json::to_value(&envelope).expect("serialize");
         assert_eq!(json["command"]["type"], "spawn");
+        // Spawns without forked history stay readable by nodes that predate it.
+        assert!(json["command"].get("history").is_none());
         assert_eq!(json["target_node_id"], "lightsail");
         let decoded: HostCommandEnvelope = serde_json::from_value(json).expect("deserialize");
         assert_eq!(decoded, envelope);

@@ -17,6 +17,8 @@ use codex_core::StartThreadOptions;
 use codex_core::ThreadManager;
 use codex_core::agent_host::agent_completion_communication;
 use codex_core::config::Config;
+use codex_history::InitialHistory;
+use codex_history::RolloutItem;
 use codex_protocol::AgentPath;
 use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
@@ -111,7 +113,9 @@ impl HostEndpoint {
             .copied();
         // Roots join the directory on their first spawn, so plain threads never need a relay.
         let team_id = child_team.unwrap_or(thread_id);
-        Ok(Arc::new(DistributedAgentControl::new(team_id, thread_id, self)))
+        Ok(Arc::new(DistributedAgentControl::new(
+            team_id, thread_id, self,
+        )))
     }
 
     /// Directory entry for a team's root thread, hosted on this node.
@@ -231,9 +235,22 @@ impl HostEndpoint {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(spawn.thread_id, spawn.team_id);
+        let initial_history = match spawn.history {
+            None => InitialHistory::New,
+            Some(values) => InitialHistory::Forked(
+                values
+                    .into_iter()
+                    .map(serde_json::from_value::<RolloutItem>)
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(|err| {
+                        CodexErr::InvalidRequest(format!("invalid forked history: {err}"))
+                    })?,
+            ),
+        };
         let started = manager
             .start_thread(StartThreadOptions {
                 reserved_thread_id: Some(spawn.thread_id),
+                initial_history,
                 environments: attachment.environments.clone(),
                 session_source: Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
                     parent_thread_id: spawn.parent_thread_id,

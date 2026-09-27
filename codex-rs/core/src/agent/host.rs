@@ -5,12 +5,20 @@
 //! results. These wrappers expose exactly those conversions, keeping model-visible text
 //! identical no matter which backend delivered it.
 
+use crate::ThreadManager;
+use crate::agent::control::build_forked_history;
 use crate::agent::types::AgentMessage;
 use crate::agent::types::MessageDeliveryMode;
+use crate::agent::types::SpawnAgentForkMode;
+use crate::config::Config;
 use crate::session_prefix::format_inter_agent_completion_message;
+use codex_history::RolloutItem;
 use codex_protocol::AgentPath;
+use codex_protocol::error::Result as CodexResult;
 use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::InterAgentCommunication;
+use codex_protocol::protocol::MultiAgentVersion;
+use codex_protocol::protocol::SessionSource;
 
 /// Attribute an agent message the same way local delivery does, preserving its wake mode.
 pub fn agent_message_communication(
@@ -49,4 +57,25 @@ pub fn parent_agent_path(agent_path: &AgentPath) -> Option<AgentPath> {
         .as_str()
         .rsplit_once('/')
         .and_then(|(parent, _)| AgentPath::try_from(parent).ok())
+}
+
+/// History for a MultiAgentV2 child forked from the parent's last `last_n_turns` turns, prepared
+/// exactly as a local fork prepares it, for a host backend that starts the child elsewhere.
+/// The child rebuilds its own initial context, so its host's instructions and tools apply.
+pub async fn remote_fork_history(
+    manager: &ThreadManager,
+    child_config: &Config,
+    child_source: &SessionSource,
+    last_n_turns: usize,
+) -> CodexResult<Vec<RolloutItem>> {
+    let forked = build_forked_history(
+        manager.state(),
+        child_config,
+        child_source,
+        &SpawnAgentForkMode::LastNTurns(last_n_turns),
+        /*usage_hints*/ None,
+        MultiAgentVersion::V2,
+    )
+    .await?;
+    Ok(forked.items)
 }

@@ -6,6 +6,7 @@ use std::sync::Mutex;
 use codex_agent_teams_wire::AgentRecord;
 use codex_agent_teams_wire::HostCommand;
 use codex_agent_teams_wire::HostReply;
+use codex_agent_teams_wire::MAX_FORK_HISTORY_BYTES;
 use codex_agent_teams_wire::SpawnAgent;
 use codex_core::AgentConfigUpdate;
 use codex_core::AgentControl;
@@ -21,11 +22,14 @@ use codex_core::LiveAgent;
 use codex_core::MessageDeliveryMode;
 use codex_core::RolloutBudgetReminder;
 use codex_core::SendRequest;
+use codex_core::SpawnAgentForkMode;
 use codex_core::SpawnRequest;
 use codex_core::ThreadConfigSnapshot;
 use codex_core::agent_host::agent_completion_communication;
 use codex_core::agent_host::agent_message_communication;
 use codex_core::agent_host::parent_agent_path;
+use codex_core::agent_host::remote_fork_history;
+use codex_history::RolloutItem;
 use codex_protocol::AgentPath;
 use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
@@ -207,6 +211,27 @@ fn live_agent(record: &AgentRecord, status: AgentStatus) -> LiveAgent {
     }
 }
 
+/// Serialize a forked history for another node, refusing one over the cap with an error the
+/// spawning model can act on.
+fn serialize_fork_history(items: &[RolloutItem], turns: usize) -> Result<Vec<serde_json::Value>> {
+    let values = items
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|err| CodexErr::Fatal(format!("cannot serialize forked history: {err}")))?;
+    let bytes = serde_json::to_vec(&values)
+        .map_err(|err| CodexErr::Fatal(format!("cannot serialize forked history: {err}")))?
+        .len();
+    if bytes > MAX_FORK_HISTORY_BYTES {
+        return Err(CodexErr::InvalidRequest(format!(
+            "fork_turns={turns} needs {} KiB of history, over the {} KiB limit for agents that may run on another machine; spawn with fewer turns or with fork_turns=\"none\" and put the needed context in the message",
+            bytes.div_ceil(1024),
+            MAX_FORK_HISTORY_BYTES / 1024
+        )));
+    }
+    Ok(values)
+}
+
 fn agent_message(input: AgentInput) -> Result<(codex_core::AgentMessage, MessageDeliveryMode)> {
     match input {
         AgentInput::Message { message, mode } => Ok((message, mode)),
@@ -246,6 +271,7 @@ impl AgentControl for DistributedAgentControl {
                 source,
                 options,
             } = request;
+            let child_source = source.clone();
             let SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
                 parent_thread_id,
                 depth,
@@ -264,12 +290,28 @@ impl AgentControl for DistributedAgentControl {
                     "spawn input must start the child turn".to_string(),
                 ));
             }
-            if options.fork_mode.is_some() {
-                warn!(
-                    "distributed spawn of {} ignores fork_turns; the member starts without the parent's history",
-                    agent_path.as_str()
-                );
-            }
+            // D8: members start fresh unless the spawn asked for the parent's last turns and
+            // those fit the cap; the full history never leaves this machine.
+            let history = match options.fork_mode {
+                None => None,
+                Some(SpawnAgentForkMode::FullHistory) => {
+                    warn!(
+                        "distributed spawn of {} does not fork full history; the member starts fresh",
+                        agent_path.as_str()
+                    );
+                    None
+                }
+                Some(SpawnAgentForkMode::LastNTurns(turns)) => {
+                    let items = remote_fork_history(
+                        self.endpoint.manager()?.as_ref(),
+                        &config,
+                        &child_source,
+                        turns,
+                    )
+                    .await?;
+                    Some(serialize_fork_history(&items, turns)?)
+                }
+            };
             // The member's node owns its settings. Forward only what this spawn changed from
             // the caller's own settings, e.g. an explicit model or a role's override.
             let caller_settings = self.caller_snapshot(caller).await?;
@@ -318,6 +360,7 @@ impl AgentControl for DistributedAgentControl {
                     agent_path,
                     MessageDeliveryMode::TriggerTurn,
                 ),
+                history,
             };
             let status = match self.dispatch(&record, HostCommand::Spawn(spawn)).await {
                 Ok(HostReply::Spawned { status }) => status,
@@ -538,7 +581,7 @@ impl AgentControl for DistributedAgentControl {
             let parent = match self.record_for_thread(*parent_thread_id).await {
                 Ok(parent) => parent,
                 Err(err) => {
-                    debug!("cannot report {} to its parent: {err}", outcome.thread_id);
+                    warn!("cannot report {} to its parent: {err}", outcome.thread_id);
                     return;
                 }
             };
@@ -548,7 +591,7 @@ impl AgentControl for DistributedAgentControl {
                 communication,
             };
             if let Err(err) = self.dispatch(&parent, command).await {
-                debug!(
+                warn!(
                     "failed to notify parent {} of {}: {err}",
                     parent.thread_id, outcome.thread_id
                 );

@@ -517,6 +517,10 @@ pub fn local_agent_graph_store_from_state_db(
 }
 
 impl ThreadManager {
+    pub(crate) fn state(&self) -> &Arc<ThreadManagerState> {
+        &self.state
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: &Config,

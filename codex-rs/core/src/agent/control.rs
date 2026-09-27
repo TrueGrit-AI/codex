@@ -76,6 +76,7 @@ mod runtime_context;
 mod sender_context;
 mod service_tier;
 mod spawn;
+pub(crate) use spawn::build_forked_history;
 mod spawn_guard;
 mod spawn_telemetry;
 mod target;

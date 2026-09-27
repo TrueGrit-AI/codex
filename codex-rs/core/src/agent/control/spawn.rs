@@ -7,6 +7,7 @@ use crate::agent::child_config::build_agent_resume_config;
 use crate::agent::role::apply_role_to_config;
 use crate::agent::types::AgentMetadata;
 use crate::agent::types::LiveAgent;
+use crate::agent::types::ResolvedMultiAgentV2UsageHints;
 use crate::agent::types::SpawnAgentForkMode;
 use crate::agent::types::SpawnAgentOptions;
 use crate::agents_md_manager::SessionInstructions;
@@ -181,6 +182,310 @@ async fn load_agent_model_context(
                 .items,
         )),
     }
+}
+
+/// Parent history a forked child starts from, already scrubbed of the parent's own instructions.
+pub(crate) struct ForkedHistory {
+    pub(crate) items: Vec<RolloutItem>,
+    pub(crate) destination_history_mode: Option<ThreadHistoryMode>,
+    pub(crate) thread_extension_init: ExtensionDataInit,
+    pub(crate) parent_thread_id: ThreadId,
+}
+
+/// Build the history a child forked from its parent starts with: the parent's model context,
+/// truncated to the fork mode and scrubbed of parent-only instructions and hints. Shared by local
+/// forks and by host backends that start the child in another process.
+pub(crate) async fn build_forked_history(
+    state: &ThreadManagerState,
+    config: &Config,
+    session_source: &SessionSource,
+    fork_mode: &SpawnAgentForkMode,
+    usage_hints: Option<&ResolvedMultiAgentV2UsageHints>,
+    multi_agent_version: MultiAgentVersion,
+) -> CodexResult<ForkedHistory> {
+    let SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        parent_thread_id, ..
+    }) = session_source
+    else {
+        return Err(CodexErr::Fatal(
+            "spawn_agent fork requires a thread-spawn session source".to_string(),
+        ));
+    };
+    let parent_thread_id = *parent_thread_id;
+    let parent_thread = state.get_thread(parent_thread_id).await?;
+    let (subagent_developer_instructions, parent_developer_instructions) = match (
+        multi_agent_version,
+        config
+            .multi_agent_v2
+            .subagent_developer_instructions
+            .as_ref(),
+    ) {
+        (MultiAgentVersion::V2, override_instructions)
+            if override_instructions.is_some() || session_source.get_agent_role().is_some() =>
+        {
+            let parent_developer_instructions = match parent_thread
+                .session
+                .new_default_turn()
+                .await
+                .developer_instructions
+                .clone()
+            {
+                Some(instructions) if !instructions.is_empty() => Some(instructions),
+                Some(_) | None => None,
+            };
+            (
+                Some(config.developer_instructions.clone().unwrap_or_default()),
+                parent_developer_instructions,
+            )
+        }
+        (MultiAgentVersion::Disabled | MultiAgentVersion::V1, _) | (MultiAgentVersion::V2, _) => {
+            (None, None)
+        }
+    };
+    let parent_history_mode = parent_thread.config_snapshot().await.history_mode;
+    // `record_conversation_items` only queues persistence writes asynchronously.
+    // Flush before snapshotting store history for a fork.
+    parent_thread.ensure_rollout_materialized().await;
+    parent_thread.flush_rollout().await?;
+
+    let destination_history_mode = matches!(parent_history_mode, ThreadHistoryMode::Paginated)
+        .then_some(ThreadHistoryMode::Paginated);
+    let mut forked_rollout_items =
+        load_agent_model_context(state, parent_thread_id, parent_history_mode)
+            .await?
+            .ok_or_else(|| {
+                CodexErr::Fatal(format!(
+                    "parent thread history unavailable for fork: {parent_thread_id}"
+                ))
+            })?;
+
+    let selected_capability_roots = forked_rollout_items
+        .iter()
+        .find_map(|item| {
+            let RolloutItem::SessionMeta(meta_line) = item else {
+                return None;
+            };
+            Some(meta_line.meta.selected_capability_roots.clone())
+        })
+        .unwrap_or_default();
+    if let SpawnAgentForkMode::LastNTurns(last_n_turns) = fork_mode {
+        forked_rollout_items =
+            truncate_rollout_to_last_n_fork_turns(forked_rollout_items, *last_n_turns);
+    }
+    let multi_agent_v2_usage_hint_texts_to_filter: Vec<String> =
+        if multi_agent_version == MultiAgentVersion::V2 {
+            let parent_config = parent_thread.session.get_config().await;
+            let parent_usage_hints = resolve_usage_hints(
+                &parent_config.multi_agent_v2,
+                ResolvedModelMessages::bundled().multi_agent(),
+                !parent_config.update_plan_enabled,
+            );
+            [parent_usage_hints.root, parent_usage_hints.subagent]
+                .into_iter()
+                .flatten()
+                .map(|instructions| instructions.render())
+                .collect()
+        } else {
+            Vec::new()
+        };
+    let mut preserve_context_baselines = matches!(fork_mode, SpawnAgentForkMode::FullHistory);
+    if preserve_context_baselines {
+        for item in forked_rollout_items.iter().rev() {
+            let RolloutItem::Compacted(compacted) = item else {
+                continue;
+            };
+            // Legacy checkpoints force the child to rebuild context regardless of the
+            // live parent's reference baseline; an older superseded checkpoint does not.
+            if compacted.replacement_history.is_none() {
+                preserve_context_baselines = false;
+            }
+            break;
+        }
+    }
+    let mut replaced_parent_developer_instructions = false;
+    // Scrub inherited hints and replace only the parent's developer-instruction fragment.
+    // Compaction stores response items separately, so sanitize both top-level messages and
+    // compacted replacement histories with the same policy.
+    let retain_forked_item = |envelope: &mut ResponseItemEnvelope, replaced: &mut bool| {
+        if multi_agent_version == MultiAgentVersion::V2
+            && matches!(&envelope.item, ResponseItem::Message { role, .. } if role == "user" || role == "assistant")
+        {
+            // Persist the scope of every inherited conversational message, including the suffix
+            // after a checkpoint. Resume must not recapture it as local authorization.
+            envelope
+                .metadata
+                .get_or_insert_default()
+                .inherited_user_message = true;
+        }
+        if let Some(metadata) = &mut envelope.metadata
+            && (metadata.sender_user_messages.take().is_some()
+                || !matches!(&envelope.item, ResponseItem::Message { role, .. } if role == "user"))
+        {
+            // Assistant and tool positions belong to the parent counter, not the child.
+            metadata.user_input_order = None;
+        }
+        let response_item = &mut envelope.item;
+        if matches!(response_item, ResponseItem::AgentMessage { .. }) {
+            return false;
+        }
+        if !retain_forked_developer_message(
+            response_item,
+            &multi_agent_v2_usage_hint_texts_to_filter,
+        ) {
+            return false;
+        }
+
+        if matches!(response_item, ResponseItem::Message { role, .. } if role == "developer") {
+            let Some(mut content) = to_annotated_content(response_item) else {
+                return false;
+            };
+            content.retain_mut(|content_item| {
+                let ContentItem::InputText { text } = content_item.content_mut() else {
+                    return true;
+                };
+                if ManagedDeveloperInstructions::matches_text(text)
+                    || PersistentModeState::matches_text(text)
+                {
+                    // If the child will rebuild its initial context, drop the inherited
+                    // instructions; startup will add the current requirements and effort
+                    // instructions once.
+                    return preserve_context_baselines;
+                }
+                let (Some(parent_developer_instructions), Some(subagent_developer_instructions)) = (
+                    parent_developer_instructions.as_ref(),
+                    subagent_developer_instructions.as_ref(),
+                ) else {
+                    return true;
+                };
+                // TODO(anp) track better message fragment provenance in rollouts.
+                if !text.contains(parent_developer_instructions) {
+                    return true;
+                }
+
+                *replaced = true;
+                let replacement = if preserve_context_baselines {
+                    subagent_developer_instructions.as_str()
+                } else {
+                    ""
+                };
+                *text = text.replace(parent_developer_instructions, replacement);
+                !text.is_empty()
+            });
+            return !content.is_empty() && set_annotated_content(response_item, content).is_some();
+        }
+
+        true
+    };
+    forked_rollout_items.retain_mut(|item| {
+        if !keep_forked_rollout_item(item, preserve_context_baselines)
+            || destination_history_mode == Some(ThreadHistoryMode::Paginated)
+                && matches!(
+                    &*item,
+                    RolloutItem::EventMsg(
+                        EventMsg::ItemCompleted(_)
+                            | EventMsg::TokenCount(_)
+                            | EventMsg::ThreadGoalUpdated(_)
+                            | EventMsg::ThreadSettingsApplied(_),
+                    )
+                )
+        {
+            return false;
+        }
+
+        match item {
+            RolloutItem::ResponseItem(response_item) => {
+                retain_forked_item(response_item, &mut replaced_parent_developer_instructions)
+            }
+            RolloutItem::Compacted(compacted) => {
+                // This compaction becomes part of the subagent's initial history. Rewrite its
+                // metadata to describe the child rather than the parent.
+                compacted.latest_token_usage_record = None;
+                if let Some(resume_metadata) = &mut compacted.resume_metadata {
+                    resume_metadata.multi_agent_version = Some(multi_agent_version);
+                    if !preserve_context_baselines {
+                        resume_metadata.previous_turn_settings = None;
+                    }
+                }
+                // Parent-local review evidence must not become the child's authorization.
+                // Root user authorization is collected separately by the host.
+                compacted.guardian_history = None;
+                // Only V2 fetches root authorization live. Its local scope starts known-empty;
+                // V1 must remain incomplete when inherited authorization has been stripped.
+                compacted.retained_context = (multi_agent_version == MultiAgentVersion::V2)
+                    .then(codex_history::RetainedContext::default);
+                if let Some(replacement_history) = compacted.replacement_history.as_mut() {
+                    // Matches before this checkpoint cannot survive its replacement history.
+                    replaced_parent_developer_instructions = false;
+                    replacement_history.retain_mut(|response_item| {
+                        retain_forked_item(
+                            response_item,
+                            &mut replaced_parent_developer_instructions,
+                        )
+                    });
+                }
+                true
+            }
+            RolloutItem::WorldState(world_state) => {
+                if multi_agent_version == MultiAgentVersion::V2 {
+                    world_state.state.remove("multi_agent_usage_hint");
+                }
+                true
+            }
+            RolloutItem::RealtimeItem(_) => false,
+            RolloutItem::EventMsg(_)
+            | RolloutItem::SessionMeta(_)
+            | RolloutItem::TurnContext(_)
+            | RolloutItem::InterAgentCommunication(_)
+            | RolloutItem::InterAgentCommunicationMetadata { .. } => true,
+            RolloutItem::RetainedContext(_)
+            | RolloutItem::TokenUsageRecord(_)
+            | RolloutItem::SecurityRiskScore(_) => false,
+        }
+    });
+    // Full forks reuse the parent's reference context instead of rebuilding it. If that
+    // context omitted the parent's developer fragment, append the child's override so its
+    // instructions still reach the model exactly once.
+    if let Some(subagent_developer_instructions) = subagent_developer_instructions.as_ref()
+        && preserve_context_baselines
+        && !replaced_parent_developer_instructions
+        && !subagent_developer_instructions.is_empty()
+        && parent_thread
+            .session
+            .reference_context_item()
+            .await
+            .is_some()
+    {
+        let developer_message = ContextualUserFragment::into(DeveloperInstructions::new(
+            subagent_developer_instructions,
+        ));
+        forked_rollout_items.push(RolloutItem::ResponseItem(developer_message.into()));
+    }
+    if preserve_context_baselines
+        && multi_agent_version == MultiAgentVersion::V2
+        && let Some(subagent_usage_hint) = usage_hints
+            .map(|hints| hints.subagent.clone())
+            .unwrap_or_else(|| {
+                resolve_usage_hints(
+                    &config.multi_agent_v2,
+                    ResolvedModelMessages::bundled().multi_agent(),
+                    !config.update_plan_enabled,
+                )
+                .subagent
+            })
+    {
+        let subagent_usage_hint_message = ContextualUserFragment::into(subagent_usage_hint);
+        forked_rollout_items.push(RolloutItem::ResponseItem(
+            subagent_usage_hint_message.into(),
+        ));
+    }
+    let mut thread_extension_init = ExtensionDataInit::new();
+    thread_extension_init.insert(selected_capability_roots);
+    Ok(ForkedHistory {
+        items: forked_rollout_items,
+        destination_history_mode,
+        thread_extension_init,
+        parent_thread_id,
+    })
 }
 
 impl LocalAgentControl {
@@ -929,291 +1234,21 @@ impl LocalAgentControl {
                 "spawn_agent fork requires a fork mode".to_string(),
             ));
         };
-        let SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-            parent_thread_id, ..
-        }) = &session_source
-        else {
-            return Err(CodexErr::Fatal(
-                "spawn_agent fork requires a thread-spawn session source".to_string(),
-            ));
-        };
-
         let fork_context_started_at = Instant::now();
-        let parent_thread_id = *parent_thread_id;
-        let parent_thread = state.get_thread(parent_thread_id).await?;
-        let (subagent_developer_instructions, parent_developer_instructions) = match (
+        let ForkedHistory {
+            items: forked_rollout_items,
+            destination_history_mode,
+            thread_extension_init,
+            parent_thread_id,
+        } = build_forked_history(
+            state,
+            &config,
+            &session_source,
+            fork_mode,
+            options.multi_agent_v2_usage_hints.as_ref(),
             multi_agent_version,
-            config
-                .multi_agent_v2
-                .subagent_developer_instructions
-                .as_ref(),
-        ) {
-            (MultiAgentVersion::V2, override_instructions)
-                if override_instructions.is_some() || session_source.get_agent_role().is_some() =>
-            {
-                let parent_developer_instructions = match parent_thread
-                    .session
-                    .new_default_turn()
-                    .await
-                    .developer_instructions
-                    .clone()
-                {
-                    Some(instructions) if !instructions.is_empty() => Some(instructions),
-                    Some(_) | None => None,
-                };
-                (
-                    Some(config.developer_instructions.clone().unwrap_or_default()),
-                    parent_developer_instructions,
-                )
-            }
-            (MultiAgentVersion::Disabled | MultiAgentVersion::V1, _)
-            | (MultiAgentVersion::V2, _) => (None, None),
-        };
-        let parent_history_mode = parent_thread.config_snapshot().await.history_mode;
-        // `record_conversation_items` only queues persistence writes asynchronously.
-        // Flush before snapshotting store history for a fork.
-        parent_thread.ensure_rollout_materialized().await;
-        parent_thread.flush_rollout().await?;
-
-        let destination_history_mode = matches!(parent_history_mode, ThreadHistoryMode::Paginated)
-            .then_some(ThreadHistoryMode::Paginated);
-        let mut forked_rollout_items =
-            load_agent_model_context(state, parent_thread_id, parent_history_mode)
-                .await?
-                .ok_or_else(|| {
-                    CodexErr::Fatal(format!(
-                        "parent thread history unavailable for fork: {parent_thread_id}"
-                    ))
-                })?;
-
-        let selected_capability_roots = forked_rollout_items
-            .iter()
-            .find_map(|item| {
-                let RolloutItem::SessionMeta(meta_line) = item else {
-                    return None;
-                };
-                Some(meta_line.meta.selected_capability_roots.clone())
-            })
-            .unwrap_or_default();
-        if let SpawnAgentForkMode::LastNTurns(last_n_turns) = fork_mode {
-            forked_rollout_items =
-                truncate_rollout_to_last_n_fork_turns(forked_rollout_items, *last_n_turns);
-        }
-        let multi_agent_v2_usage_hint_texts_to_filter: Vec<String> =
-            if multi_agent_version == MultiAgentVersion::V2 {
-                let parent_config = parent_thread.session.get_config().await;
-                let parent_usage_hints = resolve_usage_hints(
-                    &parent_config.multi_agent_v2,
-                    ResolvedModelMessages::bundled().multi_agent(),
-                    !parent_config.update_plan_enabled,
-                );
-                [parent_usage_hints.root, parent_usage_hints.subagent]
-                    .into_iter()
-                    .flatten()
-                    .map(|instructions| instructions.render())
-                    .collect()
-            } else {
-                Vec::new()
-            };
-        let mut preserve_context_baselines = matches!(fork_mode, SpawnAgentForkMode::FullHistory);
-        if preserve_context_baselines {
-            for item in forked_rollout_items.iter().rev() {
-                let RolloutItem::Compacted(compacted) = item else {
-                    continue;
-                };
-                // Legacy checkpoints force the child to rebuild context regardless of the
-                // live parent's reference baseline; an older superseded checkpoint does not.
-                if compacted.replacement_history.is_none() {
-                    preserve_context_baselines = false;
-                }
-                break;
-            }
-        }
-        let mut replaced_parent_developer_instructions = false;
-        // Scrub inherited hints and replace only the parent's developer-instruction fragment.
-        // Compaction stores response items separately, so sanitize both top-level messages and
-        // compacted replacement histories with the same policy.
-        let retain_forked_item = |envelope: &mut ResponseItemEnvelope, replaced: &mut bool| {
-            if multi_agent_version == MultiAgentVersion::V2
-                && matches!(&envelope.item, ResponseItem::Message { role, .. } if role == "user" || role == "assistant")
-            {
-                // Persist the scope of every inherited conversational message, including the suffix
-                // after a checkpoint. Resume must not recapture it as local authorization.
-                envelope
-                    .metadata
-                    .get_or_insert_default()
-                    .inherited_user_message = true;
-            }
-            if let Some(metadata) = &mut envelope.metadata
-                && (metadata.sender_user_messages.take().is_some()
-                    || !matches!(&envelope.item, ResponseItem::Message { role, .. } if role == "user"))
-            {
-                // Assistant and tool positions belong to the parent counter, not the child.
-                metadata.user_input_order = None;
-            }
-            let response_item = &mut envelope.item;
-            if matches!(response_item, ResponseItem::AgentMessage { .. }) {
-                return false;
-            }
-            if !retain_forked_developer_message(
-                response_item,
-                &multi_agent_v2_usage_hint_texts_to_filter,
-            ) {
-                return false;
-            }
-
-            if matches!(response_item, ResponseItem::Message { role, .. } if role == "developer") {
-                let Some(mut content) = to_annotated_content(response_item) else {
-                    return false;
-                };
-                content.retain_mut(|content_item| {
-                    let ContentItem::InputText { text } = content_item.content_mut() else {
-                        return true;
-                    };
-                    if ManagedDeveloperInstructions::matches_text(text)
-                        || PersistentModeState::matches_text(text)
-                    {
-                        // If the child will rebuild its initial context, drop the inherited
-                        // instructions; startup will add the current requirements and effort
-                        // instructions once.
-                        return preserve_context_baselines;
-                    }
-                    let (
-                        Some(parent_developer_instructions),
-                        Some(subagent_developer_instructions),
-                    ) = (
-                        parent_developer_instructions.as_ref(),
-                        subagent_developer_instructions.as_ref(),
-                    )
-                    else {
-                        return true;
-                    };
-                    // TODO(anp) track better message fragment provenance in rollouts.
-                    if !text.contains(parent_developer_instructions) {
-                        return true;
-                    }
-
-                    *replaced = true;
-                    let replacement = if preserve_context_baselines {
-                        subagent_developer_instructions.as_str()
-                    } else {
-                        ""
-                    };
-                    *text = text.replace(parent_developer_instructions, replacement);
-                    !text.is_empty()
-                });
-                return !content.is_empty()
-                    && set_annotated_content(response_item, content).is_some();
-            }
-
-            true
-        };
-        forked_rollout_items.retain_mut(|item| {
-            if !keep_forked_rollout_item(item, preserve_context_baselines)
-                || destination_history_mode == Some(ThreadHistoryMode::Paginated)
-                    && matches!(
-                        &*item,
-                        RolloutItem::EventMsg(
-                            EventMsg::ItemCompleted(_)
-                                | EventMsg::TokenCount(_)
-                                | EventMsg::ThreadGoalUpdated(_)
-                                | EventMsg::ThreadSettingsApplied(_),
-                        )
-                    )
-            {
-                return false;
-            }
-
-            match item {
-                RolloutItem::ResponseItem(response_item) => {
-                    retain_forked_item(response_item, &mut replaced_parent_developer_instructions)
-                }
-                RolloutItem::Compacted(compacted) => {
-                    // This compaction becomes part of the subagent's initial history. Rewrite its
-                    // metadata to describe the child rather than the parent.
-                    compacted.latest_token_usage_record = None;
-                    if let Some(resume_metadata) = &mut compacted.resume_metadata {
-                        resume_metadata.multi_agent_version = Some(multi_agent_version);
-                        if !preserve_context_baselines {
-                            resume_metadata.previous_turn_settings = None;
-                        }
-                    }
-                    // Parent-local review evidence must not become the child's authorization.
-                    // Root user authorization is collected separately by the host.
-                    compacted.guardian_history = None;
-                    // Only V2 fetches root authorization live. Its local scope starts known-empty;
-                    // V1 must remain incomplete when inherited authorization has been stripped.
-                    compacted.retained_context = (multi_agent_version == MultiAgentVersion::V2)
-                        .then(codex_history::RetainedContext::default);
-                    if let Some(replacement_history) = compacted.replacement_history.as_mut() {
-                        // Matches before this checkpoint cannot survive its replacement history.
-                        replaced_parent_developer_instructions = false;
-                        replacement_history.retain_mut(|response_item| {
-                            retain_forked_item(
-                                response_item,
-                                &mut replaced_parent_developer_instructions,
-                            )
-                        });
-                    }
-                    true
-                }
-                RolloutItem::WorldState(world_state) => {
-                    if multi_agent_version == MultiAgentVersion::V2 {
-                        world_state.state.remove("multi_agent_usage_hint");
-                    }
-                    true
-                }
-                RolloutItem::RealtimeItem(_) => false,
-                RolloutItem::EventMsg(_)
-                | RolloutItem::SessionMeta(_)
-                | RolloutItem::TurnContext(_)
-                | RolloutItem::InterAgentCommunication(_)
-                | RolloutItem::InterAgentCommunicationMetadata { .. } => true,
-                RolloutItem::RetainedContext(_)
-                | RolloutItem::TokenUsageRecord(_)
-                | RolloutItem::SecurityRiskScore(_) => false,
-            }
-        });
-        // Full forks reuse the parent's reference context instead of rebuilding it. If that
-        // context omitted the parent's developer fragment, append the child's override so its
-        // instructions still reach the model exactly once.
-        if let Some(subagent_developer_instructions) = subagent_developer_instructions.as_ref()
-            && preserve_context_baselines
-            && !replaced_parent_developer_instructions
-            && !subagent_developer_instructions.is_empty()
-            && parent_thread
-                .session
-                .reference_context_item()
-                .await
-                .is_some()
-        {
-            let developer_message = ContextualUserFragment::into(DeveloperInstructions::new(
-                subagent_developer_instructions,
-            ));
-            forked_rollout_items.push(RolloutItem::ResponseItem(developer_message.into()));
-        }
-        if preserve_context_baselines
-            && multi_agent_version == MultiAgentVersion::V2
-            && let Some(subagent_usage_hint) = options
-                .multi_agent_v2_usage_hints
-                .as_ref()
-                .map(|hints| hints.subagent.clone())
-                .unwrap_or_else(|| {
-                    resolve_usage_hints(
-                        &config.multi_agent_v2,
-                        ResolvedModelMessages::bundled().multi_agent(),
-                        !config.update_plan_enabled,
-                    )
-                    .subagent
-                })
-        {
-            let subagent_usage_hint_message = ContextualUserFragment::into(subagent_usage_hint);
-            forked_rollout_items.push(RolloutItem::ResponseItem(
-                subagent_usage_hint_message.into(),
-            ));
-        }
-        let mut thread_extension_init = ExtensionDataInit::new();
-        thread_extension_init.insert(selected_capability_roots);
+        )
+        .await?;
 
         let fork_context = fork_context_started_at.elapsed();
         let child_create_started_at = Instant::now();

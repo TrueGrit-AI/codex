@@ -15,9 +15,11 @@ workspace = true
 [dependencies]
 codex-agent-teams-wire = { workspace = true }
 codex-core = { workspace = true }
+codex-history = { workspace = true }
 codex-protocol = { workspace = true }
 codex-rollout-trace = { workspace = true }
 futures = { workspace = true }
+serde_json = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
