@@ -249,6 +249,27 @@ impl TeamRelay for ClientRelay {
         })
     }
 
+    fn record_usage(
+        &self,
+        team_id: ThreadId,
+        thread_id: ThreadId,
+        total_tokens: i64,
+    ) -> BoxFuture<'_, CodexResult<bool>> {
+        Box::pin(async move {
+            match self
+                .call(RelayRequest::Usage {
+                    team_id,
+                    thread_id,
+                    total_tokens,
+                })
+                .await?
+            {
+                RelayResponse::UsageRecorded { exhausted } => Ok(exhausted),
+                other => Err(unexpected(other)),
+            }
+        })
+    }
+
     fn agents(&self, team_id: ThreadId) -> BoxFuture<'_, CodexResult<Vec<AgentRecord>>> {
         Box::pin(async move {
             match self.call(RelayRequest::Agents { team_id }).await? {

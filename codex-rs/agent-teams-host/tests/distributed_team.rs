@@ -9,8 +9,11 @@ use std::time::Duration;
 use codex_agent_teams_host::HostEndpoint;
 use codex_agent_teams_host::InMemoryRelay;
 use codex_agent_teams_host::TeamRelay;
+use codex_agent_teams_wire::HostCommand;
+use codex_agent_teams_wire::HostReply;
 use codex_agent_teams_wire::NodeAdvertisement;
 use codex_agent_teams_wire::NodeId;
+use codex_core::TurnInputRequest;
 use codex_core::config::AgentRoleConfig;
 use codex_features::Feature;
 use codex_login::CodexAuth;
@@ -23,8 +26,10 @@ use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelVisibility;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::protocol::AgentStatus;
+use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::MultiAgentVersion;
+use codex_protocol::user_input::UserInput;
 use core_test_support::responses;
 use core_test_support::responses::ResponseMock;
 use core_test_support::skip_if_no_network;
@@ -579,6 +584,135 @@ async fn members_on_different_nodes_message_each_other_body() -> anyhow::Result<
     }
     mail.test.codex.shutdown_and_wait().await?;
     notes.test.codex.shutdown_and_wait().await?;
+    lead.test.codex.shutdown_and_wait().await?;
+    Ok(())
+}
+
+#[test]
+fn lead_learns_when_a_member_is_lost() -> anyhow::Result<()> {
+    run_test_with_large_stack(
+        "lead_learns_when_a_member_is_lost",
+        lead_learns_when_a_member_is_lost_body,
+    )
+}
+
+async fn lead_learns_when_a_member_is_lost_body() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+    let relay = InMemoryRelay::new();
+    let lead_server = responses::start_mock_server().await;
+    let member_server = responses::start_mock_server().await;
+    let lead = start_node(&relay, "lead", &[], &lead_server, None).await?;
+    let _member = start_node(&relay, "member", &["mail"], &member_server, None).await?;
+    let team_id = lead.test.session_configured.thread_id;
+
+    // The member never answers in time; the relay reports it lost instead.
+    let member_mock = responses::mount_response_sequence(
+        &member_server,
+        vec![responses::sse_response(answer("m1", "Too late.")).set_delay(Duration::from_secs(60))],
+    )
+    .await;
+    let lead_mock = responses::mount_sse_sequence(
+        &lead_server,
+        vec![
+            call(
+                "spawn",
+                "spawn_agent",
+                serde_json::json!({
+                    "task_name": "mail",
+                    "agent_type": "mail",
+                    "message": "Draft a long reply.",
+                    "fork_turns": "none",
+                }),
+            ),
+            call("wait", "wait_agent", serde_json::json!({})),
+            answer("l3", "The mail agent was lost."),
+        ],
+    )
+    .await;
+
+    lead.test
+        .codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "Start drafting.".into(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    wait_for_request(&member_mock, 1).await;
+    let mail = relay
+        .agents(team_id)
+        .await?
+        .into_iter()
+        .find(|record| record.agent_path.name() == "mail")
+        .expect("mail member registered");
+    let reply = relay
+        .dispatch(
+            &NodeId::new("lead"),
+            HostCommand::AgentLost {
+                team_id,
+                thread_id: team_id,
+                child_thread_id: mail.thread_id,
+                child_agent_path: mail.agent_path.clone(),
+                reason: "its node stopped reporting".to_string(),
+            },
+        )
+        .await?;
+    assert!(matches!(reply, HostReply::Delivered { .. }), "{reply:?}");
+    wait_for_event(&lead.test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let lead_bodies = bodies(&lead_mock);
+    assert!(
+        lead_bodies[2].contains("Sender: /root/mail")
+            && lead_bodies[2].contains("Agent errored: its node stopped reporting"),
+        "{}",
+        lead_bodies[2]
+    );
+    lead.test.codex.shutdown_and_wait().await?;
+    Ok(())
+}
+
+#[test]
+fn team_budget_stops_turns_once_exhausted() -> anyhow::Result<()> {
+    run_test_with_large_stack(
+        "team_budget_stops_turns_once_exhausted",
+        team_budget_stops_turns_once_exhausted_body,
+    )
+}
+
+async fn team_budget_stops_turns_once_exhausted_body() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+    let relay = InMemoryRelay::with_team_token_budget(50);
+    let lead_server = responses::start_mock_server().await;
+    let lead = start_node(&relay, "lead", &[], &lead_server, None).await?;
+    let team_id = lead.test.session_configured.thread_id;
+    responses::mount_sse_sequence(
+        &lead_server,
+        vec![responses::sse(vec![
+            responses::ev_response_created("r1"),
+            responses::ev_assistant_message("r1", "Working."),
+            responses::ev_completed_with_tokens("r1", 80),
+        ])],
+    )
+    .await;
+
+    lead.test
+        .codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "Use the budget.".into(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    wait_for_event(&lead.test.codex, |event| {
+        matches!(
+            event,
+            EventMsg::Error(error)
+                if error.codex_error_info == Some(CodexErrorInfo::SessionBudgetExceeded)
+        )
+    })
+    .await;
+    assert!(relay.record_usage(team_id, team_id, 0).await?);
     lead.test.codex.shutdown_and_wait().await?;
     Ok(())
 }

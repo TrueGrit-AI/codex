@@ -1,6 +1,7 @@
 //! Team coordination: placement, the team directory and command dispatch.
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::Weak;
@@ -44,6 +45,15 @@ pub trait TeamRelay: Send + Sync {
 
     /// Every known member of a team, in registration order.
     fn agents(&self, team_id: ThreadId) -> BoxFuture<'_, Result<Vec<AgentRecord>>>;
+
+    /// Count one inference response against the team's shared token budget. Returns whether
+    /// the budget is now exhausted; the usage is recorded either way.
+    fn record_usage(
+        &self,
+        team_id: ThreadId,
+        thread_id: ThreadId,
+        total_tokens: i64,
+    ) -> BoxFuture<'_, Result<bool>>;
 }
 
 struct NodeEntry {
@@ -55,6 +65,7 @@ struct NodeEntry {
 struct InMemoryState {
     nodes: BTreeMap<NodeId, NodeEntry>,
     agents: Vec<AgentRecord>,
+    usage: HashMap<ThreadId, i64>,
 }
 
 /// A relay whose nodes are endpoints in the same process. Used for tests and for single-host
@@ -62,11 +73,20 @@ struct InMemoryState {
 #[derive(Default)]
 pub struct InMemoryRelay {
     state: Mutex<InMemoryState>,
+    /// Tokens each team may use in total; unlimited when `None`.
+    team_token_budget: Option<i64>,
 }
 
 impl InMemoryRelay {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    pub fn with_team_token_budget(budget: i64) -> Arc<Self> {
+        Arc::new(Self {
+            team_token_budget: Some(budget),
+            ..Self::default()
+        })
     }
 
     /// Make an endpoint reachable and advertise what it serves.
@@ -166,6 +186,20 @@ impl TeamRelay for InMemoryRelay {
                 .agents
                 .retain(|record| !(record.team_id == team_id && record.thread_id == thread_id));
             Ok(())
+        })
+    }
+
+    fn record_usage(
+        &self,
+        team_id: ThreadId,
+        _thread_id: ThreadId,
+        total_tokens: i64,
+    ) -> BoxFuture<'_, Result<bool>> {
+        Box::pin(async move {
+            let mut state = self.lock();
+            let used = state.usage.entry(team_id).or_default();
+            *used += total_tokens.max(0);
+            Ok(self.team_token_budget.is_some_and(|budget| *used >= budget))
         })
     }
 

@@ -98,6 +98,15 @@ pub enum HostCommand {
         team_id: ThreadId,
         thread_id: ThreadId,
     },
+    /// Tell a parent that a child it spawned is gone before reporting a result: its node lost
+    /// the thread, or stopped answering. `thread_id` is the parent.
+    AgentLost {
+        team_id: ThreadId,
+        thread_id: ThreadId,
+        child_thread_id: ThreadId,
+        child_agent_path: AgentPath,
+        reason: String,
+    },
 }
 
 impl HostCommand {
@@ -106,7 +115,8 @@ impl HostCommand {
             Self::Spawn(spawn) => spawn.team_id,
             Self::Deliver { team_id, .. }
             | Self::Interrupt { team_id, .. }
-            | Self::Status { team_id, .. } => *team_id,
+            | Self::Status { team_id, .. }
+            | Self::AgentLost { team_id, .. } => *team_id,
         }
     }
 
@@ -115,7 +125,8 @@ impl HostCommand {
             Self::Spawn(spawn) => spawn.thread_id,
             Self::Deliver { thread_id, .. }
             | Self::Interrupt { thread_id, .. }
-            | Self::Status { thread_id, .. } => *thread_id,
+            | Self::Status { thread_id, .. }
+            | Self::AgentLost { thread_id, .. } => *thread_id,
         }
     }
 }
@@ -152,6 +163,12 @@ pub enum RelayRequest {
     Agents {
         team_id: ThreadId,
     },
+    /// Tokens one inference response used, counted against the team's shared budget.
+    Usage {
+        team_id: ThreadId,
+        thread_id: ThreadId,
+        total_tokens: i64,
+    },
 }
 
 /// The relay's answers, one variant per request kind. Failures travel as transport errors.
@@ -162,6 +179,8 @@ pub enum RelayResponse {
     Dispatched { reply: HostReply },
     Done,
     Agents { records: Vec<AgentRecord> },
+    /// The usage was recorded; `exhausted` means the team's budget is now used up.
+    UsageRecorded { exhausted: bool },
 }
 
 /// Versioned envelope for transports that carry `HostCommand`s between processes.

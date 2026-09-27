@@ -139,6 +139,9 @@ impl TestRelay {
                     .cloned()
                     .collect(),
             }),
+            RelayRequest::Usage { .. } => Step::Answer(RelayResponse::UsageRecorded {
+                exhausted: false,
+            }),
             RelayRequest::Dispatch { node_id, command } => {
                 self.dispatches.push((from.clone(), node_id.clone()));
                 Step::Forward {

@@ -51,14 +51,17 @@ use crate::HostEndpoint;
 /// session identity Core requires for all threads in one tree.
 pub struct DistributedAgentControl {
     team_id: ThreadId,
+    /// The thread this controller serves; usage is reported for it.
+    thread_id: ThreadId,
     endpoint: Arc<HostEndpoint>,
     service_tier: Mutex<Option<String>>,
 }
 
 impl DistributedAgentControl {
-    pub(crate) fn new(team_id: ThreadId, endpoint: Arc<HostEndpoint>) -> Self {
+    pub(crate) fn new(team_id: ThreadId, thread_id: ThreadId, endpoint: Arc<HostEndpoint>) -> Self {
         Self {
             team_id,
+            thread_id,
             endpoint,
             service_tier: Mutex::default(),
         }
@@ -494,8 +497,23 @@ impl AgentControl for DistributedAgentControl {
         None
     }
 
-    fn record_usage(&self, _usage: TokenUsage) -> BoxFuture<'_, Result<()>> {
-        Box::pin(async { Ok(()) })
+    fn record_usage(&self, usage: TokenUsage) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            match self
+                .endpoint
+                .relay()
+                .record_usage(self.team_id, self.thread_id, usage.total_tokens)
+                .await
+            {
+                Ok(true) => Err(CodexErr::SessionBudgetExceeded),
+                Ok(false) => Ok(()),
+                // Budget accounting must not stop agents when the relay is unreachable.
+                Err(err) => {
+                    warn!("team usage for {} was not recorded: {err}", self.thread_id);
+                    Ok(())
+                }
+            }
+        })
     }
 
     fn turn_finished<'a>(

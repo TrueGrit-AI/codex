@@ -15,12 +15,14 @@ use codex_core::AgentControl;
 use codex_core::CodexThread;
 use codex_core::StartThreadOptions;
 use codex_core::ThreadManager;
+use codex_core::agent_host::agent_completion_communication;
 use codex_core::config::Config;
 use codex_protocol::AgentPath;
 use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result;
+use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
@@ -109,7 +111,7 @@ impl HostEndpoint {
             .copied();
         // Roots join the directory on their first spawn, so plain threads never need a relay.
         let team_id = child_team.unwrap_or(thread_id);
-        Ok(Arc::new(DistributedAgentControl::new(team_id, self)))
+        Ok(Arc::new(DistributedAgentControl::new(team_id, thread_id, self)))
     }
 
     /// Directory entry for a team's root thread, hosted on this node.
@@ -184,6 +186,33 @@ impl HostEndpoint {
                 Ok(HostReply::Status {
                     status: thread.agent_status().await,
                 })
+            }
+            HostCommand::AgentLost {
+                team_id,
+                thread_id,
+                child_agent_path,
+                reason,
+                ..
+            } => {
+                let thread = self.team_thread(team_id, thread_id).await?;
+                // Report the loss as the child's errored result, exactly as a local failure.
+                let communication = agent_completion_communication(
+                    &child_agent_path,
+                    &AgentStatus::Errored(reason),
+                )
+                .ok_or_else(|| {
+                    CodexErr::InvalidRequest(format!(
+                        "{} has no parent to report to",
+                        child_agent_path.as_str()
+                    ))
+                })?;
+                let submission_id = thread
+                    .submit(Op::InterAgentCommunication {
+                        communication,
+                        start_options: TurnStartOptions::default(),
+                    })
+                    .await?;
+                Ok(HostReply::Delivered { submission_id })
             }
         }
     }
