@@ -34,9 +34,19 @@ jobs:
       - uses: ./.github/actions/setup-rusty-v8
         with:
           target: x86_64-apple-darwin
+      - uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            codex-rs/target
+          key: macos-intel-rust-1.99.1-dev-small-${{ hashFiles('codex-rs/Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            macos-intel-rust-1.99.1-dev-small-${{ hashFiles('codex-rs/Cargo.lock') }}-
       - name: Test Guardian configuration compatibility and validation
         working-directory: codex-rs
-        run: cargo test --locked --profile dev-small -p codex-features guardian_v2
+        run: cargo test --locked --profile dev-small --target x86_64-apple-darwin -p codex-features guardian_v2
       - name: Build native fork and runtime helpers
         working-directory: codex-rs
         run: >-
@@ -49,6 +59,7 @@ jobs:
       - name: Package binaries with source and checksum provenance
         run: |
           mkdir -p dist/package/bin
+          cp LICENSE NOTICE dist/package/
           for binary in codex codex-code-mode-host codex-responses-api-proxy; do
             cp "codex-rs/target/x86_64-apple-darwin/dev-small/$binary" "dist/package/bin/$binary"
             codesign --force --sign - "dist/package/bin/$binary"
@@ -65,11 +76,11 @@ jobs:
               'profile': 'dev-small',
               'compiler': subprocess.check_output(['rustc', '--version'], text=True).strip(),
               'files': {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
-                        for p in sorted((root / 'bin').iterdir())},
+                        for p in sorted(root.rglob('*')) if p.is_file()},
           }
           (root / 'build-manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
           PY
-          tar -czf dist/codex-fork-x86_64-apple-darwin.tar.gz -C dist/package bin build-manifest.json
+          tar -czf dist/codex-fork-x86_64-apple-darwin.tar.gz -C dist/package bin build-manifest.json LICENSE NOTICE
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
         with:
           name: codex-fork-x86_64-apple-darwin
