@@ -1,0 +1,111 @@
+name: Native team download builds
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [build/native-team-downloads]
+    paths: ['.github/workflows/fork-native-downloads.yml']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-team-downloads-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build and smoke ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: darwin-arm64
+            target: aarch64-apple-darwin
+            runner: macos-15
+          - platform: win32-x64
+            target: x86_64-pc-windows-msvc
+            runner: windows-2025
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      STABLE_GIT_COMMIT: ${{ github.sha }}
+      LIBSQLITE3_FLAGS: SQLITE_DISABLE_INTRINSIC
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: '3.12'
+      - uses: ./.github/actions/setup-rusty-v8
+        with:
+          target: ${{ matrix.target }}
+      - uses: ./.github/actions/setup-msvc-env
+        if: runner.os == 'Windows'
+        with:
+          target: ${{ matrix.target }}
+      - name: Build the customized CLI, App Server, and helpers
+        shell: bash
+        working-directory: codex-rs
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          bins=(--bin codex --bin codex-code-mode-host --bin codex-responses-api-proxy)
+          if [[ "$TARGET" == *windows* ]]; then
+            bins+=(--bin codex-windows-sandbox-setup --bin codex-windows-sandbox-service --bin codex-command-runner)
+          fi
+          cargo build --locked --profile dev-small --target "$TARGET" "${bins[@]}"
+      - name: Test desktop configuration without model calls
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          suffix=''
+          [[ "$TARGET" != *windows* ]] || suffix='.exe'
+          python3 scripts/fork-desktop-smoke.py --codex "codex-rs/target/$TARGET/dev-small/codex$suffix"
+      - name: Package native runtime with source provenance
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, shutil, subprocess, tarfile
+          target = os.environ['TARGET']
+          source = pathlib.Path('codex-rs/target') / target / 'dev-small'
+          root = pathlib.Path('dist/package')
+          (root / 'bin').mkdir(parents=True)
+          names = ['codex', 'codex-code-mode-host', 'codex-responses-api-proxy']
+          if 'windows' in target:
+              names += ['codex-windows-sandbox-setup', 'codex-windows-sandbox-service', 'codex-command-runner']
+          for name in names:
+              name += '.exe' if 'windows' in target else ''
+              shutil.copy2(source / name, root / 'bin' / name)
+          manifest = {
+              'revision': os.environ['GITHUB_SHA'], 'repository': os.environ['GITHUB_REPOSITORY'],
+              'runId': os.environ['GITHUB_RUN_ID'], 'target': target, 'profile': 'dev-small',
+              'signing': 'unsigned', 'compiler': subprocess.check_output(['rustc', '--version'], text=True).strip(),
+              'files': {str(p.relative_to(root)).replace('\\', '/'): hashlib.sha256(p.read_bytes()).hexdigest()
+                        for p in sorted((root / 'bin').iterdir())},
+          }
+          (root / 'build-manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+          archive = pathlib.Path('dist') / ('codex-fork-' + os.environ['PLATFORM'] + '.tar.gz')
+          with tarfile.open(archive, 'w:gz') as output:
+              output.add(root / 'bin', arcname='bin')
+              output.add(root / 'build-manifest.json', arcname='build-manifest.json')
+          archive.with_suffix(archive.suffix + '.sha256').write_text(hashlib.sha256(archive.read_bytes()).hexdigest() + '  ' + archive.name + '\n')
+          PY
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: codex-fork-${{ matrix.platform }}
+          path: dist/codex-fork-${{ matrix.platform }}.tar.gz*
+          if-no-files-found: error
+          retention-days: 30
