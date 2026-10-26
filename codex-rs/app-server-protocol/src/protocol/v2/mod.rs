@@ -1,6 +1,7 @@
 mod shared;
 
 mod account;
+mod agent_teams;
 mod application;
 mod apps;
 mod attestation;
@@ -42,6 +43,7 @@ mod user_verification;
 mod windows_sandbox;
 
 pub use account::*;
+pub use agent_teams::*;
 pub use application::*;
 pub use apps::*;
 pub use attestation::*;

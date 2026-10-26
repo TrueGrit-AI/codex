@@ -144,6 +144,7 @@ fn reject_removed_permission_profile(request: &JSONRPCRequest) -> Result<(), JSO
 pub(crate) struct MessageProcessor {
     pub(crate) turn_admission: TurnAdmission,
     user_verification: Arc<crate::user_verification::Service>,
+    agent_teams: Option<Arc<crate::agent_teams::AgentTeamsNode>>,
     outgoing: Arc<OutgoingMessageSender>,
     models_refresh_worker: ModelsRefreshWorker,
     turn_cost_worker: Option<TurnCostWorker>,
@@ -332,6 +333,7 @@ impl MessageProcessor {
         let extension_event_sink =
             app_server_extension_event_sink(outgoing.clone(), thread_state_manager.clone());
         let mut queue_service = None;
+        let agent_teams = crate::agent_teams::AgentTeamsNode::from_env(outgoing.clone());
         let sample_responses = Arc::new(crate::thread_sample::SampleResponseRegistry::default());
         let thread_manager = Arc::new_cyclic(|thread_manager| {
             queue_service = queue_store.map(|queue| {
@@ -385,11 +387,18 @@ impl MessageProcessor {
                     time_provider
                 }),
             );
-            match code_mode_session_provider {
+            let manager = match code_mode_session_provider {
                 Some(provider) => manager.with_code_mode_session_provider(provider),
+                None => manager,
+            };
+            match &agent_teams {
+                Some(node) => node.install(manager),
                 None => manager,
             }
         });
+        if let Some(node) = &agent_teams {
+            node.attach(&thread_manager, config.as_ref().clone());
+        }
         let model_catalog = Arc::new(crate::model_catalog::ModelCatalog::new(
             config_manager.clone(),
             startup_cwd,
@@ -603,6 +612,7 @@ impl MessageProcessor {
         Self {
             turn_admission,
             user_verification,
+            agent_teams,
             outgoing,
             models_refresh_worker,
             turn_cost_worker,
@@ -1153,6 +1163,17 @@ impl MessageProcessor {
                 .await;
             }
             ClientRequest::ServerDiagnostics { .. } => Ok(Some(read_server_diagnostics().into())),
+            ClientRequest::AgentTeamsNodeRegister { .. } => match &self.agent_teams {
+                Some(node) => Ok(Some(node.register(connection_id).into())),
+                None => Err(agent_teams_disabled()),
+            },
+            ClientRequest::AgentTeamsHostCommand { params, .. } => match &self.agent_teams {
+                Some(node) => node
+                    .host_command(params)
+                    .await
+                    .map(|response| Some(response.into())),
+                None => Err(agent_teams_disabled()),
+            },
             ClientRequest::ConfigRead { params, .. } => self
                 .config_processor
                 .read(params)
@@ -1954,6 +1975,13 @@ mod message_processor_tracing_tests;
 #[cfg(test)]
 #[path = "message_processor_gateway_oauth_tests.rs"]
 mod gateway_oauth_tests;
+
+fn agent_teams_disabled() -> JSONRPCErrorError {
+    invalid_request(format!(
+        "distributed agent teams are disabled; start the app-server with {}",
+        crate::agent_teams::NODE_ID_ENV_VAR
+    ))
+}
 
 #[cfg(test)]
 #[path = "message_processor_thread_lifecycle_tests.rs"]

@@ -570,6 +570,7 @@ mod thread_attachments;
 mod thread_enrichment;
 mod thread_fork_goal;
 mod thread_input;
+pub(crate) use thread_input::allow_operator_input_for_subagents;
 mod thread_memory;
 mod thread_processor;
 mod thread_queue_processor;

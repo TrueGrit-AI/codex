@@ -155,6 +155,9 @@ pub struct TestAppServer {
     process: Child,
     stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
+    /// Bytes of a stdout line read before its newline arrived. Kept on the struct so a read
+    /// cancelled by `select!` or a timeout resumes the same line instead of dropping it.
+    stdout_partial_line: String,
     pending_messages: VecDeque<JSONRPCMessage>,
     auto_env: Option<TestEnv>,
     json_logs: JsonLogCapture,
@@ -328,6 +331,7 @@ impl TestAppServer {
             process,
             stdin: Some(stdin),
             stdout,
+            stdout_partial_line: String::new(),
             pending_messages: VecDeque::new(),
             auto_env: None,
             json_logs,
@@ -1647,8 +1651,8 @@ impl TestAppServer {
     }
 
     async fn read_jsonrpc_message(&mut self) -> anyhow::Result<JSONRPCMessage> {
-        let mut line = String::new();
-        self.stdout.read_line(&mut line).await?;
+        self.stdout.read_line(&mut self.stdout_partial_line).await?;
+        let line = std::mem::take(&mut self.stdout_partial_line);
         let message = serde_json::from_str::<JSONRPCMessage>(&line)?;
         eprintln!("read message from stdout: {message:?}");
         Ok(message)

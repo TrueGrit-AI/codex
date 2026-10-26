@@ -564,6 +564,10 @@ pub fn local_agent_graph_store_from_state_db(
 }
 
 impl ThreadManager {
+    pub(crate) fn state(&self) -> &Arc<ThreadManagerState> {
+        &self.state
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: &Config,
@@ -973,6 +977,11 @@ impl ThreadManager {
 
     pub fn subscribe_thread_created(&self) -> broadcast::Receiver<ThreadId> {
         self.state.thread_created_tx.subscribe()
+    }
+
+    /// Announce a thread a host started directly, so subscribers treat it like a spawned agent.
+    pub fn notify_thread_created(&self, thread_id: ThreadId) {
+        self.state.notify_thread_created(thread_id);
     }
 
     pub async fn get_thread(&self, thread_id: ThreadId) -> CodexResult<Arc<CodexThread>> {

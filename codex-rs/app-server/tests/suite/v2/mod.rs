@@ -5,6 +5,7 @@ mod account_system_proxy;
 mod account_gcp;
 mod account_thread_usage;
 mod agent_message_board;
+mod agent_teams;
 mod analytics;
 mod app_installed;
 mod app_list;

@@ -9,6 +9,7 @@ use super::persisted_resume_settings::latest_persisted_model_settings;
 use super::persisted_resume_settings::latest_persisted_resume_settings;
 use super::thread_enrichment::enrich_loaded_threads;
 use super::thread_fork_goal::inherit_thread_goal_snapshot;
+use super::thread_input::accepts_operator_input;
 use super::thread_input::can_accept_direct_input;
 use super::thread_input::ensure_direct_input_allowed;
 use super::*;
@@ -4812,7 +4813,7 @@ impl ThreadRequestProcessor {
             thread_summary.session_id = existing_thread.startup_metadata().session_id.to_string();
             thread_summary.thread_source = config_snapshot.thread_source.clone().map(Into::into);
             apply_live_thread_settings(&mut thread_summary, &config_snapshot);
-            thread_summary.can_accept_direct_input = Some(can_accept_direct_input(
+            thread_summary.can_accept_direct_input = Some(accepts_operator_input(
                 existing_thread.multi_agent_version(),
                 &config_snapshot.session_source,
             ));

@@ -29,6 +29,7 @@ pub(super) fn server_request_thread_id(request: &ServerRequest) -> Option<Thread
         }
         ServerRequest::ChatgptAuthTokensRefresh { .. }
         | ServerRequest::AttestationGenerate { .. }
+        | ServerRequest::AgentTeamsRelay { .. }
         | ServerRequest::ApplyPatchApproval { .. }
         | ServerRequest::ExecCommandApproval { .. } => None,
     }
