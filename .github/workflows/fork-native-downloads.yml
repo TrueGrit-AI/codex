@@ -2,9 +2,12 @@ name: Native team download builds
 
 on:
   workflow_dispatch:
-  push:
-    branches: [build/native-team-downloads]
-    paths: ['.github/workflows/fork-native-downloads.yml']
+    inputs:
+      platform:
+        description: Native platforms to build
+        type: choice
+        default: all
+        options: [all, darwin-arm64, win32-x64]
 
 permissions:
   contents: read
@@ -21,13 +24,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - platform: darwin-arm64
-            target: aarch64-apple-darwin
-            runner: macos-15
-          - platform: win32-x64
-            target: x86_64-pc-windows-msvc
-            runner: windows-2025
+        include: ${{ fromJSON(inputs.platform == 'win32-x64' && '[{"platform":"win32-x64","target":"x86_64-pc-windows-msvc","runner":"windows-2025"}]' || inputs.platform == 'darwin-arm64' && '[{"platform":"darwin-arm64","target":"aarch64-apple-darwin","runner":"macos-15"}]' || '[{"platform":"darwin-arm64","target":"aarch64-apple-darwin","runner":"macos-15"},{"platform":"win32-x64","target":"x86_64-pc-windows-msvc","runner":"windows-2025"}]') }}
     env:
       CARGO_BUILD_JOBS: '2'
       CARGO_INCREMENTAL: '0'
@@ -51,6 +48,14 @@ jobs:
         if: runner.os == 'Windows'
         with:
           target: ${{ matrix.target }}
+      - uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25
+        id: cargo-cache
+        with:
+          key: native-team-v1-${{ matrix.target }}-${{ hashFiles('codex-rs/Cargo.lock') }}
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            codex-rs/target
       - name: Build the customized CLI, App Server, and helpers
         shell: bash
         working-directory: codex-rs
@@ -63,6 +68,14 @@ jobs:
             bins+=(--bin codex-windows-sandbox-setup --bin codex-windows-sandbox-service --bin codex-command-runner)
           fi
           cargo build --locked --profile dev-small --target "$TARGET" "${bins[@]}"
+      - uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25
+        if: steps.cargo-cache.outputs.cache-hit != 'true'
+        with:
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            codex-rs/target
       - name: Test desktop configuration without model calls
         shell: bash
         env:

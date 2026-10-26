@@ -82,7 +82,13 @@ def main():
                 print(json.dumps({'ok': True, 'structuredGuardian': True,
                                   'threadCreated': True, 'modelTurnsStarted': 0}))
             finally:
-                server.terminate()
+                if os.name == 'nt':
+                    # The test server may own helpers with cwd/SQLite handles in this home.
+                    # Stop only this server's process tree before removing the test directory.
+                    subprocess.run(['taskkill', '/PID', str(server.pid), '/T', '/F'],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                else:
+                    server.terminate()
                 try:
                     server.wait(timeout=10)
                 except subprocess.TimeoutExpired:
