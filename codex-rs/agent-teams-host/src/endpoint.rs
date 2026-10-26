@@ -29,7 +29,7 @@ use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadSource;
-use codex_protocol::protocol::TurnEnvironmentSelection;
+use codex_protocol::protocol::TurnEnvironmentRequest;
 use codex_protocol::turn_input::TurnStartOptions;
 
 use crate::DistributedAgentControl;
@@ -40,7 +40,7 @@ struct Attachment {
     manager: Weak<ThreadManager>,
     /// This node's own configuration; spawned members never inherit the spawner's.
     base_config: Config,
-    environments: Option<Vec<TurnEnvironmentSelection>>,
+    environments: Option<Vec<TurnEnvironmentRequest>>,
 }
 
 /// A node that hosts agent threads for one or more teams.
@@ -77,7 +77,7 @@ impl HostEndpoint {
         &self,
         manager: &Arc<ThreadManager>,
         base_config: Config,
-        environments: Option<Vec<TurnEnvironmentSelection>>,
+        environments: Option<Vec<TurnEnvironmentRequest>>,
     ) -> Result<()> {
         self.attachment
             .set(Attachment {

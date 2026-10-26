@@ -59,6 +59,9 @@ pub struct DistributedAgentControl {
     thread_id: ThreadId,
     endpoint: Arc<HostEndpoint>,
     service_tier: Mutex<Option<String>>,
+    /// Members stay loaded, so their sessions own queued mail. Keep an idle subscription
+    /// open for Core's mailbox observer without maintaining a second queue here.
+    mailbox_state: tokio::sync::watch::Sender<bool>,
 }
 
 impl DistributedAgentControl {
@@ -68,6 +71,7 @@ impl DistributedAgentControl {
             thread_id,
             endpoint,
             service_tier: Mutex::default(),
+            mailbox_state: tokio::sync::watch::channel(/*init*/ false).0,
         }
     }
 
@@ -213,7 +217,7 @@ fn live_agent(record: &AgentRecord, status: AgentStatus) -> LiveAgent {
 
 /// Serialize a forked history for another node, refusing one over the cap with an error the
 /// spawning model can act on.
-fn serialize_fork_history(items: &[RolloutItem], turns: usize) -> Result<Vec<serde_json::Value>> {
+fn serialize_fork_history(items: &[RolloutItem]) -> Result<Vec<serde_json::Value>> {
     let values = items
         .iter()
         .map(serde_json::to_value)
@@ -224,7 +228,7 @@ fn serialize_fork_history(items: &[RolloutItem], turns: usize) -> Result<Vec<ser
         .len();
     if bytes > MAX_FORK_HISTORY_BYTES {
         return Err(CodexErr::InvalidRequest(format!(
-            "fork_turns={turns} needs {} KiB of history, over the {} KiB limit for agents that may run on another machine; spawn with fewer turns or with fork_turns=\"none\" and put the needed context in the message",
+            "fork_turns=\"all\" needs {} KiB of history, over the {} KiB limit for agents that may run on another machine; spawn with fork_turns=\"none\" and put the needed context in the message",
             bytes.div_ceil(1024),
             MAX_FORK_HISTORY_BYTES / 1024
         )));
@@ -290,26 +294,18 @@ impl AgentControl for DistributedAgentControl {
                     "spawn input must start the child turn".to_string(),
                 ));
             }
-            // D8: members start fresh unless the spawn asked for the parent's last turns and
-            // those fit the cap; the full history never leaves this machine.
+            // Like local forks, inherit the full history when requested, subject to the
+            // serialized transfer cap. The receiving host rebuilds its own initial context.
             let history = match options.fork_mode {
                 None => None,
                 Some(SpawnAgentForkMode::FullHistory) => {
-                    warn!(
-                        "distributed spawn of {} does not fork full history; the member starts fresh",
-                        agent_path.as_str()
-                    );
-                    None
-                }
-                Some(SpawnAgentForkMode::LastNTurns(turns)) => {
                     let items = remote_fork_history(
                         self.endpoint.manager()?.as_ref(),
                         &config,
                         &child_source,
-                        turns,
                     )
                     .await?;
-                    Some(serialize_fork_history(&items, turns)?)
+                    Some(serialize_fork_history(&items)?)
                 }
             };
             // The member's node owns its settings. Forward only what this spawn changed from
@@ -421,6 +417,14 @@ impl AgentControl for DistributedAgentControl {
                 submission_id,
             })
         })
+    }
+
+    fn take_mailbox(&self, _agent: ThreadId) -> Vec<codex_core::PendingAgentMessage> {
+        Vec::new()
+    }
+
+    fn watch_mailbox(&self, _agent: ThreadId) -> tokio::sync::watch::Receiver<bool> {
+        self.mailbox_state.subscribe()
     }
 
     fn ensure_child_loaded(&self, parent: ThreadId, child: ThreadId) -> BoxFuture<'_, Result<()>> {

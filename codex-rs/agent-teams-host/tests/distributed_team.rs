@@ -147,7 +147,12 @@ async fn start_node(
     endpoint.attach(
         &test.thread_manager,
         test.config.clone(),
-        Some(vec![test.executor_environment().selection().clone()]),
+        Some(vec![
+            test.executor_environment()
+                .selection()
+                .clone()
+                .into_request(),
+        ]),
     )?;
     Ok(Node { endpoint, test })
 }
@@ -718,14 +723,19 @@ async fn team_budget_stops_turns_once_exhausted_body() -> anyhow::Result<()> {
 }
 
 #[test]
-fn member_forked_from_recent_turns_sees_the_parent_context() -> anyhow::Result<()> {
-    run_test_with_large_stack(
-        "member_forked_from_recent_turns_sees_the_parent_context",
-        member_forked_from_recent_turns_sees_the_parent_context_body,
-    )
+fn member_forked_from_full_history_sees_the_parent_context() -> anyhow::Result<()> {
+    for fork_turns in [None, Some("all"), Some("1")] {
+        run_test_with_large_stack(
+            "member_forked_from_full_history_sees_the_parent_context",
+            move || member_forked_from_full_history_sees_the_parent_context_body(fork_turns),
+        )?;
+    }
+    Ok(())
 }
 
-async fn member_forked_from_recent_turns_sees_the_parent_context_body() -> anyhow::Result<()> {
+async fn member_forked_from_full_history_sees_the_parent_context_body(
+    fork_turns: Option<&str>,
+) -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
     let relay = InMemoryRelay::new();
     let lead_server = responses::start_mock_server().await;
@@ -741,20 +751,19 @@ async fn member_forked_from_recent_turns_sees_the_parent_context_body() -> anyho
         ))],
     )
     .await;
+    let mut spawn_args = serde_json::json!({
+        "task_name": "mail",
+        "agent_type": "mail",
+        "message": "Repeat the code the user gave me.",
+    });
+    if let Some(fork_turns) = fork_turns {
+        spawn_args["fork_turns"] = fork_turns.into();
+    }
     let lead_mock = responses::mount_sse_sequence(
         &lead_server,
         vec![
             answer("l1", "Noted."),
-            call(
-                "spawn",
-                "spawn_agent",
-                serde_json::json!({
-                    "task_name": "mail",
-                    "agent_type": "mail",
-                    "message": "Repeat the code the user gave me.",
-                    "fork_turns": "2",
-                }),
-            ),
+            call("spawn", "spawn_agent", spawn_args),
             call("wait", "wait_agent", serde_json::json!({})),
             answer("l4", "Done."),
         ],
@@ -768,7 +777,7 @@ async fn member_forked_from_recent_turns_sees_the_parent_context_body() -> anyho
         .submit_turn("Ask the mail agent for my code.")
         .await?;
 
-    // The member, on another node, started from the lead's recent turns.
+    // The member, on another node, started from the lead's full history.
     wait_for_request(&member_mock, 1).await;
     let member_first = &bodies(&member_mock)[0];
     assert!(
@@ -813,7 +822,7 @@ async fn fork_over_the_cap_is_refused_with_an_actionable_error_body() -> anyhow:
                     "task_name": "mail",
                     "agent_type": "mail",
                     "message": "Summarize the notes.",
-                    "fork_turns": "2",
+                    "fork_turns": "all",
                 }),
             ),
             answer("l3", "Could not delegate."),

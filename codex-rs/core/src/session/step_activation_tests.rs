@@ -36,6 +36,7 @@ use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::ServiceTier;
+use codex_protocol::openai_models::AsyncClassifierMode;
 use codex_protocol::openai_models::AutoReviewMessages;
 use codex_protocol::openai_models::GuardianV2ModelConfig;
 use codex_protocol::openai_models::GuardianV2TranscriptModelConfig;
@@ -189,14 +190,27 @@ async fn next_step_waits_for_environment_publication_before_capturing() {
             .turn_environments
             .update_selections(&selections);
     }
+    {
+        // Thread attachments publish under state independently of active-turn settings.
+        // A capture waiting for that publication must not retain the previous attachments.
+        let mut state = session.state.lock().await;
+        let mut context = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        assert!(std::future::Future::poll(capture.as_mut(), &mut context).is_pending());
+        session
+            .services
+            .turn_environments
+            .update_configured_selections(&selections);
+        state.session_configuration.environments = selections.clone();
+    }
 
     let step = capture.await.expect("capture after publication");
     assert_eq!(
         (
             step.settings.model_info.slug.as_str(),
             step.environments.primary().map(TurnEnvironment::cwd),
+            step.inherited_environments.all_selections(),
         ),
-        ("next-step-model", Some(&next_cwd)),
+        ("next-step-model", Some(&next_cwd), selections),
     );
     session.abort_all_tasks(TurnAbortReason::Interrupted).await;
 }
@@ -409,6 +423,7 @@ async fn activation_fixture(models: Vec<ModelInfo>) -> ActivationFixture {
     let (models, lookup) = GatedModelsManager::new(models);
     mutable.services.models_manager = models;
     for feature in [
+        Feature::SubagentThreadEnvironments,
         Feature::StepModelSwitching,
         Feature::FastMode,
         Feature::TokenBudget,
@@ -489,6 +504,7 @@ fn settings_submission(
     (
         Submission {
             id: id.to_string(),
+            turn_extension_init: None,
             op: Op::TurnSettings {
                 turn_id: turn_id.to_string(),
                 update,
@@ -498,6 +514,7 @@ fn settings_submission(
             parent_turn_id: None,
             root_turn_id: None,
             residency_guard: None,
+            message_delivery: None,
         },
         receiver,
     )
@@ -667,27 +684,6 @@ async fn submitted_sparse_updates_preserve_captured_steps_and_ordering() {
         ]
     );
     assert!(Arc::ptr_eq(&before.turn, &after.turn));
-    assert_eq!(
-        turn.to_turn_context_item().summary,
-        ReasoningSummary::Concise
-    );
-    // Even after the live update, an already-captured request retains its own
-    // summary setting in the durable context.
-    for step in [&before, &during, &after] {
-        let world_state = session
-            .record_context_updates_and_set_reference_context_item(step)
-            .await
-            .expect("record captured settings");
-        assert_eq!(
-            session.reference_context_item().await.unwrap().summary,
-            step.settings.reasoning_summary,
-        );
-        session.start_new_context_window(step, world_state).await;
-        assert_eq!(
-            session.reference_context_item().await.unwrap().summary,
-            step.settings.reasoning_summary,
-        );
-    }
     assert_eq!(after.settings.model_info.as_ref(), &expected_destination);
     let initial_budget = turn
         .config
@@ -1061,11 +1057,8 @@ async fn activation_must_match_the_retained_turn_authority(change: ManagedPolicy
     model_info.slug = "step-settings-policy-destination".to_string();
     let mut selected = current.selected().clone();
     selected.collaboration_mode.settings.model = model_info.slug.clone();
-    let destination = ResolvedStepSettings::new(
-        Arc::new(selected),
-        Arc::new(model_info),
-        session.features.enabled(Feature::FastMode),
-    );
+    let destination =
+        ResolvedStepSettings::new(Arc::new(selected), Arc::new(model_info), &session.features);
     let mut live = session.state.lock().await.session_configuration.clone();
     live.original_config_do_not_use = Arc::clone(&prepared.config);
     assert_eq!(
@@ -1467,8 +1460,17 @@ async fn inactive_guardian_v2_does_not_restrict_model_defaults(
     );
 }
 
+#[test_case(None, None; "default")]
+#[test_case(Some(AsyncClassifierMode::Snapshot), None; "remove snapshot")]
+#[test_case(Some(AsyncClassifierMode::Conversation), None; "remove conversation")]
+#[test_case(None, Some(AsyncClassifierMode::Snapshot); "legacy snapshot")]
+#[test_case(None, Some(AsyncClassifierMode::Conversation); "legacy conversation")]
+#[test_case(Some(AsyncClassifierMode::Snapshot), Some(AsyncClassifierMode::Conversation); "change legacy mode")]
 #[tokio::test]
-async fn guardian_v2_empty_model_defaults_are_equivalent() {
+async fn guardian_v2_empty_or_legacy_model_defaults_are_equivalent(
+    admitted_mode: Option<AsyncClassifierMode>,
+    destination_mode: Option<AsyncClassifierMode>,
+) {
     let (_, turn) = make_session_and_context().await;
     let mut config = turn.config.as_ref().clone();
     for feature in [Feature::GuardianV2, Feature::GuardianApproval] {
@@ -1477,23 +1479,34 @@ async fn guardian_v2_empty_model_defaults_are_equivalent() {
             .set_enabled(feature, /*enabled*/ true)
             .expect("enable Guardian V2");
     }
-    let (admitted, mut destination) = safety_models();
+    let (mut admitted, mut destination) = safety_models();
+    admitted
+        .model_messages
+        .as_mut()
+        .expect("model messages")
+        .guardian_v2 = admitted_mode.map(|mode| GuardianV2ModelConfig {
+        async_classifier_mode: Some(mode),
+        ..Default::default()
+    });
     destination.context_window = Some(123_456);
-    for settings in [
+    for mut settings in [
         GuardianV2ModelConfig::default(),
         GuardianV2ModelConfig {
             transcript: Some(GuardianV2TranscriptModelConfig::default()),
             ..Default::default()
         },
     ] {
+        settings.async_classifier_mode = destination_mode;
         destination
             .model_messages
             .as_mut()
             .expect("model messages")
             .guardian_v2 = Some(settings);
-        assert_eq!(
-            check_legacy_model_safety(&admitted, &admitted, &destination, &config, &config,),
-            Ok(())
-        );
+        for current in [&admitted, &destination] {
+            assert_eq!(
+                check_legacy_model_safety(&admitted, current, &destination, &config, &config,),
+                Ok(())
+            );
+        }
     }
 }

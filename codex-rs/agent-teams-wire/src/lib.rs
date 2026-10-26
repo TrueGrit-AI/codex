@@ -77,8 +77,8 @@ pub struct SpawnAgent {
     pub reasoning_effort: Option<ReasoningEffort>,
     /// The attributed first message; it always starts the child's first turn.
     pub initial_message: InterAgentCommunication,
-    /// Parent history the child is forked from (serialized rollout items), when the spawn asked
-    /// for the parent's last turns. At most [`MAX_FORK_HISTORY_BYTES`] serialized.
+    /// Full parent history the child is forked from (serialized rollout items), when requested.
+    /// At most [`MAX_FORK_HISTORY_BYTES`] serialized.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history: Option<Vec<serde_json::Value>>,
 }
