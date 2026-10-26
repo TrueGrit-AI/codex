@@ -28,6 +28,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8
         with:
           targets: x86_64-apple-darwin
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: "3.12"
       - uses: ./.github/actions/setup-rusty-v8
         with:
           target: x86_64-apple-darwin
